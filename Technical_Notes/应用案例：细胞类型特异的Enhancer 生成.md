@@ -104,7 +104,7 @@ $$
 </p>
 <figcaption>表3. CPT模型生成序列的Motif特性比对。参考HOCOMOCO，验证集涵盖12个细胞类型，27695条序列。基于不同可靠性阈值（Jaccard index/LCS ratio），CPT模型的生成能力均优于基础模型。</figcaption>
 
-
+<div>&nbsp;</div>
 **分析验证**
 
     参考序列：seq_103539为例。
@@ -129,6 +129,7 @@ $$
 
 2.  Motif模式：106 个 motif，LCS ratio=0.9639, motif jaccard=0.9358。
 
+<div>&nbsp;</div>
 **参考文献**
 
 [1] Genos Team. Genos: A Human-Centric Genomic Foundation Model[J]. GigaScience, 2025: giaf132.
