@@ -21,7 +21,6 @@
 
 参考增强子源于ENCODE数据库(The ENCODE Project Consortium；2020)(https://www.encodeproject.org)。基于hg38参考基因组\[8\]，获得961,227条增强子参考序列。通过与Motif 数据库HOCOMOCOv11\_full\_HUMAN\_ mono(Russian Academy of Sciences，2017，https://hocomoco13.autosome.org)比对，计算生成序列中包含的Motif 数量与特征。
 
-
 **模型设计**
 
 -   **下游模型架构设计**
@@ -48,25 +47,16 @@
 针对CPT模型生成的序列，采用Blast序列比对方法和Motif模式特征方法进行分析，评估生成序列的生物学合理性与可信度。
 
 -   **Blast**：通过与已知增强子序列集合进行blastn比对，判断该序列是否为高可信度增强子序列。
-
     1.  覆盖度（Coverage）：表示查询序列（query）被成功比对到了目标序列（subject）的比例，定义如下：
-
 $$Coverage\  = \ \frac{比对区域的长度}{查询序列的总长度} \times 100\%$$
-
     2.  同一性/序列相似性（Identity）：表示在比对区域内，查询序列和目标序列完全一致的碱基数量占比，定义如下：
-
 $$Identity\  = \ \frac{相同碱基的数量}{比对区域的长度} \times 100\%$$
 
 -   **Motif**：生成序列包含与真实增强子序列拥有相似的 motif 特征，则可视该序列为高可信度增强子。
-
     1.  基于人类motif 数据库HOCOMOCO，利用MEME FIMO，提取CPT模型生成序列的 motif 特征。基于贡献模式与排列顺序，对motif特征进行计算；
-
     2.  Jaccard index：衡量两个 motif 集合间的重叠程度，反映共有motif组合占所有motif类型的比例，定义如下：
-
 $$Jaccard\ index\  = \ \frac{\mid A \cap B \mid}{\mid A \cup B \mid} \times 100\%$$
-
     3.  最长共同子序列比例（LCS ratio）：衡量两个 motif 序列在顺序上的相似度，相同 motif出现的顺序越相同，该值越高，定义如下：
-
 $$LCS\ ratio\  = \ \frac{共同最长子字符串长度}{较长字符串长度} \times 100\%.$$
 
 <!-- -->
