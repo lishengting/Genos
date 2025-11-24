@@ -125,6 +125,7 @@ $$
 <p align="center">
   <img src="images-enhancer/table-004.png" style="width:50%; max-width:300px; display:inline-block;"/>
 </p>
+*图1：BLAST 比对结果中的覆盖度（Coverage）与同一性（Identity）分布。*
 
 表4. seq\_103539的blast分析。
 
