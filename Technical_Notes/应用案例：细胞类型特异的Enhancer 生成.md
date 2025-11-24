@@ -35,8 +35,8 @@
 
 模型训练基于Z2000完成，训练8个周期，训练Tokens数量达到40B，学习率和训练loss 如下所示：
 <p align="center">
-  <img src="images-enhancer/image-001.png" style="width:45%; max-width:400px; display:inline-block;"/>
-  <img src="images-enhancer/image-002.png" style="width:45%; max-width:400px; display:inline-block;"/>
+  <img src="images-enhancer/image-001.png" style="width:35%; max-width:300px; display:inline-block;"/>
+  <img src="images-enhancer/image-002.png" style="width:35%; max-width:300px; display:inline-block;"/>
 </p>
 图1. 学习率与loss曲线。随着训练步数增加，学习率保持稳定，模型loss呈现稳定下降趋势。当训练步数达到30000时，模型loss 趋于收敛。
 
