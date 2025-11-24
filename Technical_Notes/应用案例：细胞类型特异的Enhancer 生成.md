@@ -17,9 +17,12 @@
 
 **数据来源**
 
-训练数据来源于公共数据库EnhancerAtlas 2.0（The Wilmer Eye Institute, 2019，http://www.enhanceratlas.org），基于hg19参考基因组\[7\]，共提取4,035,437增强子参考序列。增强子参考序列覆盖197种细胞类型，总计9,918,133,647 bp，序列长度范围为10--31,210,920 bp。
+训练数据来源于公共数据库EnhancerAtlas 2.0（The Wilmer Eye Institute, 2019，http://www.enhanceratlas.org），
+基于hg19参考基因组\[7\]，共提取4,035,437增强子参考序列。增强子参考序列覆盖197种细胞类型，总计9,918,133,647 bp，序列长度范围为10--31,210,920 bp。
 
-参考增强子源于ENCODE数据库(The ENCODE Project Consortium；2020)(https://www.encodeproject.org)。基于hg38参考基因组\[8\]，获得961,227条增强子参考序列。通过与Motif 数据库HOCOMOCOv11\_full\_HUMAN\_ mono(Russian Academy of Sciences，2017，https://hocomoco13.autosome.org)比对，计算生成序列中包含的Motif 数量与特征。
+参考增强子源于ENCODE数据库(The ENCODE Project Consortium；2020)(https://www.encodeproject.org)。
+基于hg38参考基因组\[8\]，获得961,227条增强子参考序列。通过与Motif 数据库HOCOMOCOv11\_full\_HUMAN\_ mono(Russian Academy of Sciences，2017，https://hocomoco13.autosome.org)
+比对，计算生成序列中包含的Motif 数量与特征。
 
 **模型设计**
 
