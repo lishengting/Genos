@@ -70,39 +70,26 @@ $$LCS\ ratio\  = \ \frac{共同最长子字符串长度}{较长字符串长度} 
 
 -   **Blast比对**
 
-```{=html}
-<!-- -->
-```
 -   set2set（ENCODE database based）
 
- <p align="center">
-  <img src="images-enhancer/table-001.png" style="width:45%; max-width:400px; display:inline-block;"/>
+<p align="center">
+  <img src="images-enhancer/table-001.png" style="width:70%; max-width:400px; display:inline-block;"/>
 </p>
 
 表1. CPT模型生成序列集的blast比对。Prompt序列长度设置为30bp，CPT模型生成的序列经过BWA过滤，获取159584条可靠序列。参考ENCODE数据集，CPT模型生成的高质量enhancer 序列数量多于基础模型生成的enhancer序列。当identity95%&coverage95%时，CPT模型的生成能力超过基础模型10倍。
 
 -   seq2seq（target sequence based）
-
-  --------------------------- ---------------- --------------- ------------ ---------
-                              **Base Model**   **CPT Model**                
-  prompt length               30bp             10bp            **30bp**     100bp
-  identity95% & coverage95%   332              818             **24,590**   72,192
-  identity90% & coverage90%   562              850             **25,683**   76,100
-  identity80% & coverage80%   1,024            904             **27,570**   83,570
-  identity70% & coverage70%   1,366            941             **29,064**   89,853
-  identity50% & coverage50%   2,095            1012            **31,444**   101,528
-  --------------------------- ---------------- --------------- ------------ ---------
+<p align="center">
+  <img src="images-enhancer/table-002.png" style="width:70%; max-width:400px; display:inline-block;"/>
+</p>
 
 表2. CPT模型生成序列的blast比对。Prompt序列长度设置为30bp，CPT模型生成enhancer 能力在不同置信度（identity & coverage）下均优于基础模型。当identity95%&coverage95%时，CPT模型的生成能力超过基础模型10倍。
 
 -   **Motif比对(**prompt=30bp**)**
 
-  ----------------------------------- ------------ ---------------
-  模型                                Base Model   **CPT Model**
-  12 celltype                         **27,695**   
-  Accard index\>0.5                   143          **824**
-  Jaccard index\>0.5&LCS ratio\>0.5   15           **269**
-  ----------------------------------- ------------ ---------------
+ <p align="center">
+  <img src="images-enhancer/table-003.png" style="width:70%; max-width:400px; display:inline-block;"/>
+</p>
 
 表3. CPT模型生成序列的Motif特性比对。参考HOCOMOCO，验证集涵盖12个细胞类型，27695条序列。基于不同可靠性阈值（Jaccard index/LCS ratio），CPT模型的生成能力均优于基础模型。
 
@@ -112,9 +99,6 @@ $$LCS\ ratio\  = \ \frac{共同最长子字符串长度}{较长字符串长度} 
 
     参考增强子：EH38D2920180::chr17:28908863-28909208
 
-```{=html}
-<!-- -->
-```
 -   **Base Model**
 
 1.  Blast比对：no significant match。
@@ -126,11 +110,9 @@ $$LCS\ ratio\  = \ \frac{共同最长子字符串长度}{较长字符串长度} 
 -   **CPT model**
 
 1.  Blast比对
-
-  ---------- -------- -------- ---------- --------- --------
-  最高得分   总得分   覆盖率   期望值     相似度    序列长
-  652        652      99.00%   4.6e-173   100.00%   345
-  ---------- -------- -------- ---------- --------- --------
+ <p align="center">
+  <img src="images-enhancer/table-004.png" style="width:70%; max-width:400px; display:inline-block;"/>
+</p>
 
 表4. seq\_103539的blast分析。
 
