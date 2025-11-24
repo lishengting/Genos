@@ -75,15 +75,9 @@ $$LCS\ ratio\  = \ \frac{共同最长子字符串长度}{较长字符串长度} 
 ```
 -   set2set（ENCODE database based）
 
-  --------------------------- ---------------- --------------- ------------- ---------
-                              **Base Model**   **CPT Model**                 
-  prompt length               30bp             10bp            **30bp**      100bp
-  初筛                        106,218          193,144         **159,584**   208,871
-  identity50% & coverage50%   50,470           166,707         **114,160**   175,274
-  dentity80% & coverage80%    43,093           138,290         **97,742**    152,091
-  identity90% & coverage90%   29,015           110,427         **75,497**    127,877
-  identity95% & coverage95%   4,754            90,818          **52,027**    108,552
-  --------------------------- ---------------- --------------- ------------- ---------
+ <p align="center">
+  <img src="images-enhancer/table-001.png" style="width:45%; max-width:400px; display:inline-block;"/>
+</p>
 
 表1. CPT模型生成序列集的blast比对。Prompt序列长度设置为30bp，CPT模型生成的序列经过BWA过滤，获取159584条可靠序列。参考ENCODE数据集，CPT模型生成的高质量enhancer 序列数量多于基础模型生成的enhancer序列。当identity95%&coverage95%时，CPT模型的生成能力超过基础模型10倍。
 
