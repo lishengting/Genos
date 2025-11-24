@@ -52,9 +52,7 @@
 
 
    $$
-
    \text{Coverage} = \frac{\text{比对区域的长度}}{\text{查询序列的总长度}} \times 100\%
-
    $$
 
 
@@ -62,9 +60,7 @@
 
 
    $$
-
    \text{Identity} = \frac{\text{相同碱基的数量}}{\text{比对区域的长度}} \times 100\%
-
    $$
 
 
