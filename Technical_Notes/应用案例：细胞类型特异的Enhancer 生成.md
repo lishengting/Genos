@@ -136,24 +136,17 @@ $$
 
 2.  Khoury G, Gruss P., Enhancer Elements, Cell, 1983,33(2):313-314
 
-3.  Gao T, Qian J., EnhancerAtlas 2.0: An Updated Resource with Enhancer Annotation in 586 Tissue/Cell Types Across Nine Species, Nucleic Acids
-
+3.  Gao T, Qian J., EnhancerAtlas 2.0: An Updated Resource with Enhancer Annotation in 586 Tissue/Cell Types Across Nine Species, Nucleic Acids 
     Research, 2020,48(D1):D58-D64
 
 4.  Boratyn G M, Camacho C, Cooper P S, et al., BLAST:A More Efficient Report with usability improvements, Nucleic acids research, 2013,41(W1):W29-W33
 
-5.  D\'haeseleer, P., What are DNA sequence motifs? Nat. Biotechnol,
-
-    2006,24:423-425
+5.  D\'haeseleer, P., What are DNA sequence motifs? Nat. Biotechnol, 2006,24:423-425
 
 6.  The ENCODE Project Consortium., Moore, J.E., Purcaro, M.J. et al., Expanded encyclopaedias of DNA elements in the human and mouse genomes, Nature, 2020,583:699-710.
 
-7.  Church DM, Schneider VA, Graves T, et al., Modernizing reference
+7.  Church DM, Schneider VA, Graves T, et al., Modernizing reference genome assemblies, Plos. Biology, 2011,9(7):e1001091
 
-    genome assemblies, Plos. Biology, 2011,9(7):e1001091
-
-8.  Guo, Yan et al.,Improvements and impacts of GRCh38 human reference on high throughput sequencing data analysis, Genomics,2017,109(2):
-
-    83-90
+8.  Guo, Yan et al.,Improvements and impacts of GRCh38 human reference on high throughput sequencing data analysis, Genomics,2017,109(2):83-90
 
 ****
