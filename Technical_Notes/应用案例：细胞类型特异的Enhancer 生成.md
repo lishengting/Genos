@@ -66,13 +66,13 @@
   2.  Jaccard index：衡量两个 motif 集合间的重叠程度，反映共有motif组合占所有motif类型的比例，定义如下：
 
 $$
-Jaccard\ index\  = \ \frac{\mid A \cap B \mid}{\mid A \cup B \mid} \times 100\%
+\text{Jaccard index}  = \ \frac{\mid A \cap B \mid}{\mid A \cup B \mid} \times 100\%
 $$
     
   3.  最长共同子序列比例（LCS ratio）：衡量两个 motif 序列在顺序上的相似度，相同 motif出现的顺序越相同，该值越高，定义如下：
 
 $$
-LCS\ ratio\  = \ \frac{共同最长子字符串长度}{较长字符串长度} \times 100\%.
+\text{LCS ratio}  = \ \frac{共同最长子字符串长度}{较长字符串长度} \times 100\%.
 $$
 
 
