@@ -133,7 +133,7 @@ $$
 
 <div>&nbsp;</div>
 
-## 📚 Citation 引用说明
+## Citation 引用说明
 
 > Genos Team, Hangzhou, China. (2025). *Genos 应用案例: 细胞类型特异的 Enhancer 生成* [Technical Note]. Zenodo. https://doi.org/10.5281/zenodo.17718684
 
