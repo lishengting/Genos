@@ -133,6 +133,17 @@ $$
 
 <div>&nbsp;</div>
 
+**引用**
+@Technote{author = {Genos Team, Hangzhou, China},
+    title = {Genos 应用案例:细胞类型特异的 Enhancer 生成},
+    year = {2025},
+    month = {11},
+    doi = {doi.org/10.5281/zenodo.17718684},
+    url = {https://doi.org/10.5281/zenodo.17718684},
+}
+
+<div>&nbsp;</div>
+
 **参考文献**
 
 [1] Genos Team. Genos: A Human-Centric Genomic Foundation Model[J]. GigaScience, 2025: giaf132.
