@@ -34,7 +34,7 @@ def parse_arguments():
     parser.add_argument('--sequence_length', type=int, default=8192, help='生成的随机DNA序列长度')
     parser.add_argument('--output_file', type=str, default=None, help='embedding输出文件名')
     parser.add_argument('--use_flash_attention', action='store_true', help='是否使用Flash Attention加速（需要安装flash_attn包）')
-    parser.add_argument('--use_npu', action='store_true', help='尝试使用华为昇腾NPU进行推理（失败时会自动回退到GPU或CPU）')
+    parser.add_argument('--use_cpu', action='store_true', help='强制使用CPU进行推理，不使用NPU或GPU')
     
     # API模式参数
     parser.add_argument('--token', type=str, default=None, help='Genos API密钥')
@@ -58,14 +58,14 @@ def generate_random_dna_sequence(length=8192):
     seqs = random.choices(bases, k=length)
     return ''.join(seqs)
 
-def load_model_and_tokenizer(model_path, use_flash_attention=False, use_npu=False):
+def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=False):
     """
     加载预训练模型和分词器
     
     Args:
         model_path: 本地模型路径
         use_flash_attention: 是否使用Flash Attention加速
-        use_npu: 尝试使用华为昇腾NPU（失败时自动回退到GPU或CPU）
+        use_cpu: 是否强制使用CPU（忽略NPU和GPU）
     
     Returns:
         tuple: (tokenizer, model)
@@ -79,36 +79,23 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_npu=Fals
     device = None
     torch_dtype = None
     
-    # 如果用户要求使用NPU，则尝试使用，失败时捕获异常并回退
-    if use_npu:
-        # try:
-        #     # 直接尝试使用NPU设备，不导入torch_npu
-        #     # 检查是否有可用的NPU设备
-        #     if hasattr(torch.backends, 'npu') and torch.backends.npu.is_available():
-        #         device = "npu:0"
-        #         print("成功使用华为昇腾NPU进行推理")
-        #         torch_dtype = torch.float32  # 昇腾NPU通常使用Float32
-        #     else:
-        #         # 尝试直接创建npu设备的tensor来检测
-        #         test_tensor = torch.tensor([1.0], device="npu:0")
-        #         # 如果没有抛出异常，则NPU可用
-        #         test_tensor.cpu()  # 清理tensor
-        #         device = "npu:0"
-        #         print("成功使用华为昇腾NPU进行推理")
-        #         torch_dtype = torch.float32
-        # except Exception as e:
-        #     print(f"尝试使用昇腾NPU失败: {str(e)}")
-        #     print("自动回退到GPU或CPU")
-        #     # 设置device为None，稍后会尝试使用GPU或CPU
-        #     device = None
-        if torch.npu.is_available():
-             device = "npu:0"
-             torch_dtype = torch.float32
-             print("使用华为昇腾NPU进行推理")
-        else:
-            print("未检测到昇腾NPU支持")
+    # 如果强制使用CPU
+    if use_cpu:
+        device = "cpu"
+        torch_dtype = torch.float32
+        print("强制使用CPU进行推理")
+    else:
+        # 优先检查NPU
+        try:
+            if torch.npu.is_available():
+                device = "npu:0"
+                torch_dtype = torch.float32
+                print("使用华为昇腾NPU进行推理")
+        except Exception as e:
+            print(f"检测NPU时出错: {str(e)}")
+            device = None
     
-    # 如果NPU不可用或使用失败，尝试使用GPU
+    # 如果NPU不可用或强制CPU不启用，尝试使用GPU
     if device is None:
         if torch.cuda.is_available():
             device = "cuda:0"
@@ -317,7 +304,7 @@ def main():
             return
         
         # 加载模型和分词器
-        tokenizer, model = load_model_and_tokenizer(args.model_path, args.use_flash_attention, args.use_npu)
+        tokenizer, model = load_model_and_tokenizer(args.model_path, args.use_flash_attention, args.use_cpu)
         
         # 提取embedding
         embeddings = extract_embeddings_locally(model, tokenizer, sequence)
