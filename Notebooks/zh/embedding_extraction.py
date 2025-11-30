@@ -20,6 +20,8 @@ import random
 import numpy as np
 from transformers import AutoModel, AutoTokenizer
 
+# 不再预先检查NPU可用性，而是在实际使用时通过try-except捕获异常
+
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='生物序列Embedding提取工具')
@@ -32,6 +34,7 @@ def parse_arguments():
     parser.add_argument('--sequence_length', type=int, default=8192, help='生成的随机DNA序列长度')
     parser.add_argument('--output_file', type=str, default=None, help='embedding输出文件名')
     parser.add_argument('--use_flash_attention', action='store_true', help='是否使用Flash Attention加速（需要安装flash_attn包）')
+    parser.add_argument('--use_npu', action='store_true', help='尝试使用华为昇腾NPU进行推理（失败时会自动回退到GPU或CPU）')
     
     # API模式参数
     parser.add_argument('--token', type=str, default=None, help='Genos API密钥')
@@ -55,13 +58,14 @@ def generate_random_dna_sequence(length=8192):
     seqs = random.choices(bases, k=length)
     return ''.join(seqs)
 
-def load_model_and_tokenizer(model_path, use_flash_attention=False):
+def load_model_and_tokenizer(model_path, use_flash_attention=False, use_npu=False):
     """
     加载预训练模型和分词器
     
     Args:
         model_path: 本地模型路径
         use_flash_attention: 是否使用Flash Attention加速
+        use_npu: 尝试使用华为昇腾NPU（失败时自动回退到GPU或CPU）
     
     Returns:
         tuple: (tokenizer, model)
@@ -71,12 +75,34 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False):
     # 加载分词器
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
-    # 根据是否有GPU选择合适的数据类型
-    if not torch.cuda.is_available():
-        print("注意: 未检测到GPU，使用Float32而不是BFloat16以兼容CPU")
-        torch_dtype = torch.float32
-    else:
-        torch_dtype = torch.bfloat16
+    # 确定运行设备和数据类型
+    device = None
+    torch_dtype = None
+    
+    # 如果用户要求使用NPU，则尝试使用，失败时捕获异常并回退
+    if use_npu:
+        try:
+            # 尝试导入torch_npu并使用NPU
+            #import torch_npu
+            device = "npu:0"
+            print("成功使用华为昇腾NPU进行推理")
+            torch_dtype = torch.float32  # 昇腾NPU通常使用Float32
+        except Exception as e:
+            print(f"尝试使用昇腾NPU失败: {str(e)}")
+            print("自动回退到GPU或CPU")
+            # 设置device为None，稍后会尝试使用GPU或CPU
+            device = None
+    
+    # 如果NPU不可用或使用失败，尝试使用GPU
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda:0"
+            torch_dtype = torch.bfloat16
+        else:
+            # 使用CPU作为最后的备选
+            device = "cpu"
+            print("注意: 未检测到可用的GPU，使用CPU进行推理")
+            torch_dtype = torch.float32
     
     # 准备模型参数
     model_kwargs = {
@@ -85,22 +111,37 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False):
         'trust_remote_code': True
     }
     
-    # 如果启用了Flash Attention，则添加相应参数
-    if use_flash_attention and torch.cuda.is_available():
+    # 如果启用了Flash Attention且使用GPU，则添加相应参数
+    if use_flash_attention and device.startswith("cuda"):
         print("启用Flash Attention加速")
         model_kwargs['attn_implementation'] = "flash_attention_2"
     else:
-        print("使用默认注意力实现（不依赖flash_attn包）")
+        print("使用默认注意力实现")
     
     # 加载模型
     model = AutoModel.from_pretrained(model_path, **model_kwargs)
     
-    # 检查是否有可用的GPU
-    if torch.cuda.is_available():
-        model.cuda()
-        print("模型已加载到GPU")
-    else:
-        print("警告: 未检测到可用的GPU，使用CPU进行推理")
+    # 将模型移至相应设备
+    try:
+        if device.startswith("npu"):
+            model = model.to(device)
+            print(f"模型已成功加载到{device}")
+        elif device.startswith("cuda"):
+            model = model.to(device)
+            print(f"模型已加载到{device}")
+        else:
+            print("模型在CPU上运行")
+    except Exception as e:
+        # 如果移至NPU失败，回退到GPU或CPU
+        if device.startswith("npu"):
+            print(f"将模型移至NPU失败: {str(e)}")
+            print("尝试回退到GPU或CPU")
+            if torch.cuda.is_available():
+                device = "cuda:0"
+                model = model.to(device)
+                print(f"模型已回退到{device}")
+            else:
+                print("模型在CPU上运行")
     
     # 设置为评估模式
     model.eval()
@@ -121,12 +162,26 @@ def extract_embeddings_locally(model, tokenizer, sequence):
     """
     print("正在提取embedding...")
     
+    # 确定运行设备
+    device = next(model.parameters()).device
+    
     # 编码序列
     inputs = tokenizer(sequence, return_tensors="pt")
     
-    # 将数据移至GPU（如果可用）
-    if torch.cuda.is_available():
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+    # 将数据移至相应设备
+    try:
+        if device.type == 'npu':
+            # 昇腾NPU设备
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        elif device.type == 'cuda':
+            # GPU设备
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        # CPU设备不需要移动
+    except Exception as e:
+        # 如果移至NPU失败，尝试使用CPU
+        if device.type == 'npu':
+            print(f"将数据移至NPU失败: {str(e)}")
+            print("尝试使用CPU继续处理")
     
     # 模型推理
     with torch.no_grad():
@@ -141,15 +196,31 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         print(f"Layer {i} embedding ({layer_embedding.shape}): {layer_embedding[0, 0, :10]}")
         print("-" * 50)
         
-        # 转换为numpy并保存
-        if torch.cuda.is_available():
-            embeddings_dict[f'layer_{i}'] = layer_embedding.numpy()
-        else:
-            # CPU环境下需要将BFloat16转换为Float32，因为numpy不支持BFloat16
-            if layer_embedding.dtype == torch.bfloat16:
-                print(f"注意: 在CPU上运行时将BFloat16转换为Float32")
-                layer_embedding = layer_embedding.to(torch.float32)
-            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
+        # 根据设备类型处理tensor转换
+        try:
+            if device.type == 'npu':
+                # 昇腾NPU: 先转换为CPU，再转为numpy
+                embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
+            elif device.type == 'cuda':
+                # GPU: 可以直接转为numpy
+                embeddings_dict[f'layer_{i}'] = layer_embedding.numpy()
+            else:
+                # CPU: 检查数据类型并可能需要转换
+                if layer_embedding.dtype == torch.bfloat16:
+                    print(f"注意: 在CPU上运行时将BFloat16转换为Float32")
+                    layer_embedding = layer_embedding.to(torch.float32)
+                embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
+        except Exception as e:
+            # 如果从NPU获取tensor失败，尝试先移至CPU
+            if device.type == 'npu':
+                print(f"从NPU获取embedding失败: {str(e)}")
+                print("尝试先移至CPU再处理")
+                try:
+                    layer_embedding_cpu = layer_embedding.cpu()
+                    embeddings_dict[f'layer_{i}'] = layer_embedding_cpu.numpy()
+                except Exception as inner_e:
+                    print(f"CPU处理也失败: {str(inner_e)}")
+                    raise
     
     return embeddings_dict
 
@@ -239,7 +310,7 @@ def main():
             return
         
         # 加载模型和分词器
-        tokenizer, model = load_model_and_tokenizer(args.model_path, args.use_flash_attention)
+        tokenizer, model = load_model_and_tokenizer(args.model_path, args.use_flash_attention, args.use_npu)
         
         # 提取embedding
         embeddings = extract_embeddings_locally(model, tokenizer, sequence)
