@@ -81,23 +81,39 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_npu=Fals
     
     # 如果用户要求使用NPU，则尝试使用，失败时捕获异常并回退
     if use_npu:
-        try:
-            # 尝试导入torch_npu并使用NPU
-            #import torch_npu
-            device = "npu:0"
-            print("成功使用华为昇腾NPU进行推理")
-            torch_dtype = torch.float32  # 昇腾NPU通常使用Float32
-        except Exception as e:
-            print(f"尝试使用昇腾NPU失败: {str(e)}")
-            print("自动回退到GPU或CPU")
-            # 设置device为None，稍后会尝试使用GPU或CPU
-            device = None
+        # try:
+        #     # 直接尝试使用NPU设备，不导入torch_npu
+        #     # 检查是否有可用的NPU设备
+        #     if hasattr(torch.backends, 'npu') and torch.backends.npu.is_available():
+        #         device = "npu:0"
+        #         print("成功使用华为昇腾NPU进行推理")
+        #         torch_dtype = torch.float32  # 昇腾NPU通常使用Float32
+        #     else:
+        #         # 尝试直接创建npu设备的tensor来检测
+        #         test_tensor = torch.tensor([1.0], device="npu:0")
+        #         # 如果没有抛出异常，则NPU可用
+        #         test_tensor.cpu()  # 清理tensor
+        #         device = "npu:0"
+        #         print("成功使用华为昇腾NPU进行推理")
+        #         torch_dtype = torch.float32
+        # except Exception as e:
+        #     print(f"尝试使用昇腾NPU失败: {str(e)}")
+        #     print("自动回退到GPU或CPU")
+        #     # 设置device为None，稍后会尝试使用GPU或CPU
+        #     device = None
+        if torch.npu.is_available():
+             device = "npu:0"
+             torch_dtype = torch.float32
+             print("使用华为昇腾NPU进行推理")
+        else:
+            print("未检测到昇腾NPU支持")
     
     # 如果NPU不可用或使用失败，尝试使用GPU
     if device is None:
         if torch.cuda.is_available():
             device = "cuda:0"
             torch_dtype = torch.bfloat16
+            print("使用NVIDIA GPU进行推理")
         else:
             # 使用CPU作为最后的备选
             device = "cpu"
@@ -107,7 +123,7 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_npu=Fals
     # 准备模型参数
     model_kwargs = {
         'output_hidden_states': True,
-        'torch_dtype': torch_dtype,
+        'dtype': torch_dtype,  # 使用dtype代替已废弃的torch_dtype
         'trust_remote_code': True
     }
     
@@ -121,6 +137,7 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_npu=Fals
     # 加载模型
     model = AutoModel.from_pretrained(model_path, **model_kwargs)
     
+    # 将模型移至相应设备
     # 将模型移至相应设备
     try:
         if device.startswith("npu"):
@@ -169,6 +186,7 @@ def extract_embeddings_locally(model, tokenizer, sequence):
     inputs = tokenizer(sequence, return_tensors="pt")
     
     # 将数据移至相应设备
+    # 将数据移至相应设备
     try:
         if device.type == 'npu':
             # 昇腾NPU设备
@@ -197,30 +215,19 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         print("-" * 50)
         
         # 根据设备类型处理tensor转换
-        try:
-            if device.type == 'npu':
-                # 昇腾NPU: 先转换为CPU，再转为numpy
-                embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
-            elif device.type == 'cuda':
-                # GPU: 可以直接转为numpy
-                embeddings_dict[f'layer_{i}'] = layer_embedding.numpy()
-            else:
-                # CPU: 检查数据类型并可能需要转换
-                if layer_embedding.dtype == torch.bfloat16:
-                    print(f"注意: 在CPU上运行时将BFloat16转换为Float32")
-                    layer_embedding = layer_embedding.to(torch.float32)
-                embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
-        except Exception as e:
-            # 如果从NPU获取tensor失败，尝试先移至CPU
-            if device.type == 'npu':
-                print(f"从NPU获取embedding失败: {str(e)}")
-                print("尝试先移至CPU再处理")
-                try:
-                    layer_embedding_cpu = layer_embedding.cpu()
-                    embeddings_dict[f'layer_{i}'] = layer_embedding_cpu.numpy()
-                except Exception as inner_e:
-                    print(f"CPU处理也失败: {str(inner_e)}")
-                    raise
+        # 不再需要try-except，直接使用PyTorch原生的device处理逻辑
+        if device.type == 'npu':
+            # 昇腾NPU: 先转换为CPU，再转为numpy
+            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
+        elif device.type == 'cuda':
+            # GPU: 可以直接转为numpy
+            embeddings_dict[f'layer_{i}'] = layer_embedding.numpy()
+        else:
+            # CPU: 检查数据类型并可能需要转换
+            if layer_embedding.dtype == torch.bfloat16:
+                print(f"注意: 在CPU上运行时将BFloat16转换为Float32")
+                layer_embedding = layer_embedding.to(torch.float32)
+            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
     
     return embeddings_dict
 
