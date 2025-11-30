@@ -91,14 +91,14 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
     # 如果强制使用CPU
     if use_cpu:
         device = "cpu"
-        torch_dtype = torch.float32
+        torch_dtype = torch.float16
         print("强制使用CPU进行推理")
     else:
         # 优先检查NPU
         try:
             if torch.npu.is_available():
                 device = "npu:0"
-                torch_dtype = torch.float32
+                torch_dtype = torch.float16
                 print("使用华为昇腾NPU进行推理")
         except Exception as e:
             print(f"检测NPU时出错: {str(e)}")
@@ -114,7 +114,7 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
             # 使用CPU作为最后的备选
             device = "cpu"
             print("注意: 未检测到可用的GPU，使用CPU进行推理")
-            torch_dtype = torch.float32
+            torch_dtype = torch.float16
     
     # 准备模型参数
     model_kwargs = {
@@ -221,8 +221,8 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         else:
             # CPU: 检查数据类型并可能需要转换
             if layer_embedding.dtype == torch.bfloat16:
-                print(f"注意: 在CPU上运行时将BFloat16转换为Float32")
-                layer_embedding = layer_embedding.to(torch.float32)
+                print(f"注意: 在CPU上运行时将BFloat16转换为Float16")
+                layer_embedding = layer_embedding.to(torch.float16)
             embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
     
     return embeddings_dict
