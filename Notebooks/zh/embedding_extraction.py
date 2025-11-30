@@ -71,15 +71,22 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False):
     # 加载分词器
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
+    # 根据是否有GPU选择合适的数据类型
+    if not torch.cuda.is_available():
+        print("注意: 未检测到GPU，使用Float32而不是BFloat16以兼容CPU")
+        torch_dtype = torch.float32
+    else:
+        torch_dtype = torch.bfloat16
+    
     # 准备模型参数
     model_kwargs = {
         'output_hidden_states': True,
-        'torch_dtype': torch.bfloat16,
+        'torch_dtype': torch_dtype,
         'trust_remote_code': True
     }
     
     # 如果启用了Flash Attention，则添加相应参数
-    if use_flash_attention:
+    if use_flash_attention and torch.cuda.is_available():
         print("启用Flash Attention加速")
         model_kwargs['attn_implementation'] = "flash_attention_2"
     else:
@@ -136,9 +143,13 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         
         # 转换为numpy并保存
         if torch.cuda.is_available():
-            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
-        else:
             embeddings_dict[f'layer_{i}'] = layer_embedding.numpy()
+        else:
+            # CPU环境下需要将BFloat16转换为Float32，因为numpy不支持BFloat16
+            if layer_embedding.dtype == torch.bfloat16:
+                print(f"注意: 在CPU上运行时将BFloat16转换为Float32")
+                layer_embedding = layer_embedding.to(torch.float32)
+            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
     
     return embeddings_dict
 
