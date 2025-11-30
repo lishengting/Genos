@@ -14,6 +14,15 @@
     python embedding_extraction.py --api_mode --token "your_api_key" --model_name "Genos-1.2B" --pooling_method "mean"
 """
 
+# 导入必要的库
+import os
+
+# 设置OpenBLAS线程数，避免警告
+# 这些环境变量会限制BLAS库使用的线程数量，防止"precompiled NUM_THREADS exceeded"警告
+os.environ['OMP_NUM_THREADS'] = '24'  # 设置OpenMP线程数
+os.environ['OPENBLAS_NUM_THREADS'] = '24'  # 设置OpenBLAS线程数
+os.environ['NUMEXPR_NUM_THREADS'] = '24'  # NumExpr库线程数
+
 import argparse
 import torch
 import random
@@ -115,7 +124,7 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
     }
     
     # 如果启用了Flash Attention且使用GPU，则添加相应参数
-    if use_flash_attention and device.startswith("cuda"):
+    if use_flash_attention and (device.startswith("cuda") or device.startswith("npu")):
         print("启用Flash Attention加速")
         model_kwargs['attn_implementation'] = "flash_attention_2"
     else:
