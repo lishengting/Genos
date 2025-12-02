@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Embedding提取Flask API服务
-基于benchmark2.py的逻辑，提供DNA序列embedding提取的API接口
+Embedding提取API服务
+基于embedding_extraction.py的逻辑，提供DNA序列embedding提取的API接口
+支持GPU、NPU和CPU设备
 """
 
 import torch
 import os
-from flask import Flask, request, json
 from transformers import AutoModel, AutoTokenizer
 import logging
 
@@ -15,9 +15,58 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 设置CUDA设备
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 设置OpenBLAS线程数，避免警告
+os.environ['OMP_NUM_THREADS'] = '24'
+os.environ['OPENBLAS_NUM_THREADS'] = '24'
+os.environ['NUMEXPR_NUM_THREADS'] = '24'
+
+# 确定运行设备和数据类型
+def get_device_and_dtype(force_cpu=False):
+    """
+    确定模型运行设备和数据类型
+    优先级: NPU > GPU > CPU
+    
+    Args:
+        force_cpu: 是否强制使用CPU
+        
+    Returns:
+        tuple: (device, torch_dtype)
+    """
+    device = None
+    torch_dtype = None
+    
+    # 如果强制使用CPU
+    if force_cpu:
+        device = "cpu"
+        torch_dtype = torch.float16
+        logger.info("强制使用CPU进行推理")
+        return device, torch_dtype
+    
+    # 优先检查NPU
+    try:
+        if torch.npu.is_available():
+            device = "npu:0"
+            torch_dtype = torch.float16
+            logger.info("使用华为昇腾NPU进行推理")
+            return device, torch_dtype
+    except Exception as e:
+        logger.warning(f"检测NPU时出错: {str(e)}")
+    
+    # 如果NPU不可用，尝试使用GPU
+    if torch.cuda.is_available():
+        device = "cuda:0"
+        torch_dtype = torch.bfloat16
+        logger.info("使用NVIDIA GPU进行推理")
+    else:
+        # 使用CPU作为最后的备选
+        device = "cpu"
+        torch_dtype = torch.float16
+        logger.info("未检测到可用的GPU/NPU，使用CPU进行推理")
+    
+    return device, torch_dtype
+
+# 获取默认设备
+default_device, default_dtype = get_device_and_dtype()
 
 import asyncio
 lock = asyncio.Lock()
@@ -25,16 +74,28 @@ lock = asyncio.Lock()
 class EmbeddingExtractor:
     """Embedding提取器类，封装序列embedding提取逻辑"""
     
-    def __init__(self, model_path, model_type="flash", device="cuda", model_name="1.2B"):
+    def __init__(self, model_path, model_type="flash", device=None, torch_dtype=None, model_name="1.2B", force_cpu=False):
         """
         初始化Embedding提取器
         
         Args:
             model_path (str): 模型路径
             model_type (str): 模型类型，"flash" 或 "no_flash"
-            device (str): 设备类型，"cuda" 或 "cpu"
+            device (str, optional): 设备类型，如果为None则自动选择
+            torch_dtype (torch.dtype, optional): 数据类型，如果为None则根据设备自动选择
+            model_name (str): 模型名称
+            force_cpu (bool): 是否强制使用CPU
         """
+        # 如果未指定设备，则自动选择
+        if device is None or torch_dtype is None:
+            auto_device, auto_dtype = get_device_and_dtype(force_cpu)
+            if device is None:
+                device = auto_device
+            if torch_dtype is None:
+                torch_dtype = auto_dtype
+                
         self.device = torch.device(device)
+        self.torch_dtype = torch_dtype
         self.model_type = model_type
         self.model_path = model_path
         self.model_name = model_name
@@ -43,53 +104,62 @@ class EmbeddingExtractor:
     def load_model(self):
         """加载预训练模型和tokenizer"""
         try:
-            logger.info(f"加载模型 {self.model_path} 到 {self.device}...")
+            logger.info(f"加载模型 {self.model_path} 到 {self.device}，数据类型: {self.torch_dtype}...")
             
             # 加载tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path, 
                 trust_remote_code=True
             )
-            # 加载模型
-            #import sglang as sgl
-            #self.model = sgl.Engine(
-            #    model_path=self.model_path,
-            #    enable_return_hidden_states=True,
-            #    chunked_prefill_size=30000,
-            #    dtype="bfloat16",
-            #    attention_backend="flashinfer",
-            #    allow_auto_truncate=False,
-            #    skip_tokenizer_init=True,
-            #    disable_radix_cache=False,
-                #enable_hierarchical_cache=False,
-                #enable_memory_saver=False,
-                #disable_cuda_graph=True,
-                #torch_compile_max_bs=1,
-            #    max_running_requests=1,
-                #kv_cache_dtype="fp8_e5m2",
-                #quantization="fp8"
-            #)
+            
             # 配置模型加载参数
             kwargs = dict(
                 output_hidden_states=True,
+                dtype=self.torch_dtype,
                 trust_remote_code=True
             )
             
-            # Flash Attention优化
-            if self.model_type == "flash":
+            # Flash Attention优化（仅在GPU上启用）
+            if self.model_type == "flash" and self.device.type == "cuda":
+                logger.info("启用Flash Attention加速")
                 kwargs.update(dict(
-                    attn_implementation="flash_attention_2",
-                    torch_dtype=torch.bfloat16
+                    attn_implementation="flash_attention_2"
                 ))
+            else:
+                logger.info("使用默认注意力实现")
             
             # 加载模型
             self.model = AutoModel.from_pretrained(self.model_path, **kwargs)
             
             # 移到指定设备并设置为评估模式
-            if self.device.type == "cuda":
-                self.model = self.model.eval().cuda()
-            else:
-                self.model = self.model.eval()
+            try:
+                if self.device.type == "npu":
+                    # 昇腾NPU设备
+                    self.model = self.model.to(self.device)
+                    logger.info(f"模型已成功加载到{self.device}")
+                elif self.device.type == "cuda":
+                    # GPU设备
+                    self.model = self.model.to(self.device)
+                    logger.info(f"模型已加载到{self.device}")
+                else:
+                    # CPU设备
+                    self.model = self.model.eval()
+                    logger.info("模型在CPU上运行")
+            except Exception as e:
+                # 如果移至NPU失败，回退到GPU或CPU
+                if self.device.type == "npu":
+                    logger.error(f"将模型移至NPU失败: {str(e)}")
+                    logger.info("尝试回退到GPU或CPU")
+                    if torch.cuda.is_available():
+                        self.device = torch.device("cuda:0")
+                        self.model = self.model.to(self.device)
+                        logger.info(f"模型已回退到{self.device}")
+                    else:
+                        self.device = torch.device("cpu")
+                        self.model = self.model.eval()
+                        logger.info("模型在CPU上运行")
+                else:
+                    raise e
 
             logger.info("✅ 模型加载完成")
         except Exception as e:
@@ -118,41 +188,33 @@ class EmbeddingExtractor:
             inputs = self.tokenizer(sequence, return_tensors="pt")
             
             # 移到指定设备
-            if self.device.type == "cuda":
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-
-            #sampling_params = {
-            #    "max_new_tokens": 0
-            #}
-            
-            #global lock
-            #async with lock:
-            #    print(224)
-            #    input_ids = inputs["input_ids"].tolist()
-            #    print(223)
-            #    outputs = await self.model.async_generate(input_ids=input_ids, return_hidden_states=True, sampling_params=sampling_params)
-            #    await self.model.tokenizer_manager.flush_cache()
-
-            #output = outputs[0]
-            #hidden_states_list = [
-            #    torch.tensor(item, dtype=torch.bfloat16).to(device)
-            #    for item in output["meta_info"]["hidden_states"]
-            #]
-            #last_hidden_state = torch.cat(
-            #    [i.unsqueeze(0) if len(i.shape) == 1 else i for i in hidden_states_list],
-            #    dim=0
-            #).to(device)
-            #print(last_hidden_state.shape)
+            try:
+                if self.device.type == "npu":
+                    # 昇腾NPU设备
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                elif self.device.type == "cuda":
+                    # GPU设备
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                # CPU设备不需要移动
+            except Exception as e:
+                # 如果移至NPU失败，尝试使用CPU
+                if self.device.type == "npu":
+                    logger.warning(f"将数据移至NPU失败: {str(e)}")
+                    logger.info("尝试使用CPU继续处理")
 
             # 前向传播获取embedding
             with torch.no_grad():
                 outputs = self.model(**inputs)
+                # 根据设备类型同步
                 if self.device.type == "cuda":
                     torch.cuda.synchronize()
+                elif self.device.type == "npu":
+                    # NPU也需要同步
+                    torch.npu.synchronize()
             
             # 提取最后一层隐藏状态
             last_hidden_state = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_dim]
-            print(last_hidden_state.shape)
+            logger.debug(f"last_hidden_state shape: {last_hidden_state.shape}")
             
             # 获取attention mask
             attention_mask = inputs.get(
@@ -163,10 +225,9 @@ class EmbeddingExtractor:
             # 根据池化方法处理embedding
             if pooling_method == "mean":
                 # 平均池化（考虑attention mask）
-                mask = attention_mask.unsqueeze(-1).to(device)
-                print(mask.shape)
+                mask = attention_mask.unsqueeze(-1).to(self.device)  # 使用self.device而不是全局device
+                logger.debug(f"mask shape: {mask.shape}")
                 pooled_embedding = (last_hidden_state * mask).sum(1) / mask.sum(1)
-                pooled_embedding = pooled_embedding.float()
                 
             elif pooling_method == "max":
                 # 最大池化
@@ -183,8 +244,19 @@ class EmbeddingExtractor:
             else:
                 raise ValueError(f"不支持的池化方法: {pooling_method}")
             
-            # 转换为numpy数组
-            embedding_array = pooled_embedding.cpu().numpy()
+            # 根据设备类型处理tensor转换
+            if self.device.type == "npu":
+                # 昇腾NPU: 先转换为CPU，再转为numpy
+                embedding_array = pooled_embedding.cpu().numpy()
+            elif self.device.type == "cuda":
+                # GPU: 可以直接转为numpy
+                embedding_array = pooled_embedding.cpu().numpy()
+            else:
+                # CPU: 检查数据类型并可能需要转换
+                if pooled_embedding.dtype == torch.bfloat16:
+                    logger.warning(f"注意: 在CPU上运行时将BFloat16转换为Float16")
+                    pooled_embedding = pooled_embedding.to(torch.float16)
+                embedding_array = pooled_embedding.numpy()
             
             # 构建返回结果
             result = {
@@ -198,7 +270,7 @@ class EmbeddingExtractor:
                 "device": str(self.device),
                 "embedding": embedding_array.tolist()  # 转换为列表便于JSON序列化
             }
-            print(time.time() - start) 
+            logger.debug(f"处理时间: {time.time() - start:.4f}秒") 
             return result
             
         except Exception as e:
@@ -234,27 +306,28 @@ class EmbeddingExtractor:
 extractors = {}
 
 
-def get_or_create_extractor(model_name):
+def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtype=None):
     """
     获取或创建指定模型的提取器
     
     Args:
         model_name (str): 模型名称
+        force_cpu (bool): 是否强制使用CPU
+        device (str, optional): 设备类型，如果为None则自动选择
+        torch_dtype (torch.dtype, optional): 数据类型，如果为None则根据设备自动选择
         
     Returns:
         EmbeddingExtractor: 提取器实例
     """
-    # 模型配置（与benchmark2.py保持一致）
+    # 模型配置（与embedding_extraction.py保持一致）
     model_configs = {
         "1.2B": {
             "path": "./onehot-mix1b-4n-8k-315b-b1-256-tp1pp1ep1-iter_0157014",
             "type": "flash",
-            "device": "cuda",
         },
         "10B": {
             "path": "./Mixtral_onehot_mix_10b_12L_16n_8k_eod_pai_211_0804_315B",
             "type": "flash",
-            "device": "cuda",
         }
     }
     
@@ -270,8 +343,10 @@ def get_or_create_extractor(model_name):
     extractor = EmbeddingExtractor(
         model_path=config["path"],
         model_type=config["type"],
-        device=config["device"],
-        model_name=model_name
+        device=device,
+        torch_dtype=torch_dtype,
+        model_name=model_name,
+        force_cpu=force_cpu
     )
     extractors[model_name] = extractor
     
@@ -327,12 +402,60 @@ async def extract_embedding(request):
         "result": result
     })
    
-def run_server():
-    extractor = get_or_create_extractor("1.2B")
-    extractor = get_or_create_extractor("10B")
+def run_server(args):
+    """
+    运行embedding服务
+    
+    Args:
+        args: 命令行参数
+    """
+    # 根据命令行参数确定设备设置
+    force_cpu = args.force_cpu
+    device = args.device if args.device else None
+    torch_dtype = None
+    
+    # 初始化模型提取器
+    logger.info(f"正在初始化模型提取器，强制CPU: {force_cpu}, 指定设备: {device}")
+    extractor = get_or_create_extractor("1.2B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype)
+    extractor = get_or_create_extractor("10B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype)
+    
+    # 启动服务器
+    logger.info(f"正在启动服务器，监听地址: {args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, single_process=True)
 
-    app.run(host="0.0.0.0", port=8001, single_process=True)
+
+def parse_arguments():
+    """
+    解析命令行参数
+    
+    Returns:
+        argparse.Namespace: 命令行参数
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description='DNA序列Embedding提取服务')
+    
+    # 服务器配置
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='服务器监听地址')
+    parser.add_argument('--port', type=int, default=8001, help='服务器监听端口')
+    
+    # 设备配置
+    parser.add_argument('--force_cpu', action='store_true', help='强制使用CPU进行推理')
+    parser.add_argument('--device', type=str, default=None, help='指定运行设备 (npu:0, cuda:0, cpu)')
+    
+    # 日志配置
+    parser.add_argument('--log_level', type=str, default='INFO', 
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='日志级别')
+    
+    return parser.parse_args()
+
 
 if __name__ == '__main__':
-    run_server()
+    # 解析命令行参数
+    args = parse_arguments()
+    
+    # 设置日志级别
+    logger.setLevel(getattr(logging, args.log_level))
+    
+    # 运行服务器
+    run_server(args)
     
