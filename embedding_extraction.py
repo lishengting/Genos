@@ -119,7 +119,7 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
     # 准备模型参数
     model_kwargs = {
         'output_hidden_states': True,
-        'dtype': torch_dtype,  # 使用dtype代替已废弃的torch_dtype
+        'torch_dtype': torch_dtype,  # 使用dtype代替已废弃的torch_dtype
         'trust_remote_code': True
     }
     
