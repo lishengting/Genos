@@ -110,6 +110,101 @@ class EmbeddingExtractor:
             return f"当前GPU内存使用: {current_allocated:.2f}GB, 最大峰值: {max_allocated:.2f}GB, 保留内存: {reserved:.2f}GB"
         return "不适用 (非CUDA设备)"
     
+    def _force_release_gpu_memory(self, original_device_type):
+        """
+        强制释放GPU内存，使用多种方法确保彻底释放
+        
+        Args:
+            original_device_type (str): 原始设备类型 ("cuda" 或 "npu")
+        
+        Returns:
+            bool: 是否成功释放（通过检查内存是否减少来判断）
+        """
+        import gc
+        import time
+        
+        if original_device_type != "cuda":
+            return True
+        
+        logger.info("开始强制释放GPU内存...")
+        
+        # 记录释放前的内存
+        before_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+        before_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+        logger.info(f"释放前内存: 已分配 {before_memory:.2f}GB, 保留 {before_reserved:.2f}GB")
+        
+        # 方法1: 将模型移到CPU再删除（如果模型还存在）
+        if hasattr(self, 'model') and self.model is not None:
+            try:
+                logger.info("将模型移到CPU以释放GPU内存...")
+                # 获取模型所在的设备
+                try:
+                    first_param = next(self.model.parameters())
+                    model_device = first_param.device
+                    if model_device.type == "cuda":
+                        # 将模型移到CPU
+                        self.model = self.model.cpu()
+                        logger.info("模型已移到CPU")
+                except:
+                    pass
+            except Exception as e:
+                logger.warning(f"将模型移到CPU时出错: {e}")
+        
+        # 方法2: 删除所有可能的引用
+        if hasattr(self, 'model'):
+            del self.model
+            self.model = None
+        if hasattr(self, 'tokenizer'):
+            del self.tokenizer
+            self.tokenizer = None
+        
+        # 方法3: 多次垃圾回收
+        for i in range(3):
+            gc.collect()
+            if i < 2:
+                time.sleep(0.1)  # 短暂等待让GC完成
+        
+        # 方法4: 清理CUDA缓存（多次）
+        for i in range(3):
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            if i < 2:
+                time.sleep(0.1)  # 短暂等待让CUDA完成释放
+        
+        # 方法5: 再次垃圾回收
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 方法6: 重置内存统计
+        try:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        except:
+            pass
+        
+        # 等待一段时间让CUDA真正释放内存
+        time.sleep(0.5)
+        
+        # 再次清理
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # 检查释放后的内存
+        after_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+        after_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+        logger.info(f"释放后内存: 已分配 {after_memory:.2f}GB, 保留 {after_reserved:.2f}GB")
+        
+        # 计算释放的内存
+        memory_freed = before_memory - after_memory
+        reserved_freed = before_reserved - after_reserved
+        
+        if memory_freed > 0.1 or reserved_freed > 0.1:  # 至少释放了100MB
+            logger.info(f"✅ 成功释放GPU内存: 已分配内存减少 {memory_freed:.2f}GB, 保留内存减少 {reserved_freed:.2f}GB")
+            return True
+        else:
+            logger.warning(f"⚠️ GPU内存释放不明显: 已分配内存减少 {memory_freed:.2f}GB, 保留内存减少 {reserved_freed:.2f}GB")
+            # 即使释放不明显，也继续尝试，因为可能是CUDA的内存碎片化问题
+            return True
+    
     def load_model(self):
         """加载预训练模型和tokenizer"""
         logger.info(f"开始加载模型，路径: {self.model_path}, 设备: {self.device}, 数据类型: {self.torch_dtype}, 模型类型: {self.model_type}")
@@ -130,47 +225,24 @@ class EmbeddingExtractor:
                         # 如果无法获取，使用self.device
                         original_device_type = self.device.type if hasattr(self, 'device') else None
                 
-                # 记录释放前的显存使用情况
+                # 使用强制释放方法
                 if original_device_type == "cuda":
-                    logger.info(f"释放前 - {self.get_gpu_memory_info()}")
-                
-                # 删除模型和tokenizer
-                del self.model
-                if hasattr(self, 'tokenizer'):
-                    del self.tokenizer
-                
-                # 强制Python垃圾回收
-                import gc
-                gc.collect()
-                
-                # 根据原始设备类型执行对应的缓存清理
-                if original_device_type == "cuda":
-                    # 执行多次显存清理操作以增强效果
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                    # 再次垃圾回收
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    # 重置峰值内存统计，以便更准确地观察内存释放
-                    # 获取CUDA设备对象
-                    cuda_device = None
-                    if hasattr(self, 'device') and self.device.type == "cuda":
-                        cuda_device = self.device
-                    else:
-                        # 尝试从原始设备获取，或使用默认cuda:0
+                    self._force_release_gpu_memory(original_device_type)
+                elif original_device_type == "npu":
+                    # NPU的释放
+                    import gc
+                    if hasattr(self, 'model') and self.model is not None:
                         try:
-                            cuda_device = torch.device("cuda:0")
+                            self.model = self.model.cpu()
                         except:
                             pass
-                    if cuda_device is not None:
-                        torch.cuda.reset_peak_memory_stats(cuda_device)
-                    # 记录释放后的显存使用情况
-                    # 注意：如果设备已切换，get_gpu_memory_info可能不适用
-                    if hasattr(self, 'device') and self.device.type == "cuda":
-                        logger.info(f"释放后 - {self.get_gpu_memory_info()}")
-                    else:
-                        logger.info("释放后 - 设备已切换，无法获取GPU内存信息")
-                elif original_device_type == "npu":
+                    if hasattr(self, 'model'):
+                        del self.model
+                        self.model = None
+                    if hasattr(self, 'tokenizer'):
+                        del self.tokenizer
+                        self.tokenizer = None
+                    gc.collect()
                     torch.npu.empty_cache()
                     gc.collect()
             
@@ -199,7 +271,32 @@ class EmbeddingExtractor:
                 logger.info("使用默认注意力实现")
             
             # 加载模型
-            self.model = AutoModel.from_pretrained(self.model_path, **kwargs)
+            try:
+                self.model = AutoModel.from_pretrained(self.model_path, **kwargs)
+            except RuntimeError as e:
+                # 如果加载模型时内存不足，尝试强制释放后重试
+                if "CUDA out of memory" in str(e) and self.device.type == "cuda":
+                    logger.warning("加载模型时GPU内存不足，尝试强制释放内存后重试...")
+                    # 强制释放GPU内存（如果之前有模型的话）
+                    if hasattr(self, 'model') and self.model is not None:
+                        self._force_release_gpu_memory("cuda")
+                    # 再次尝试加载
+                    try:
+                        logger.info("强制释放内存后，再次尝试加载模型...")
+                        self.model = AutoModel.from_pretrained(self.model_path, **kwargs)
+                    except Exception as retry_error:
+                        logger.error(f"强制释放内存后仍然无法加载模型: {retry_error}")
+                        error_msg = (
+                            f"GPU内存不足，无法加载模型。已尝试强制释放内存但仍失败。\n"
+                            f"错误详情: {retry_error}\n"
+                            f"当前GPU内存使用: {self.get_gpu_memory_info()}\n"
+                            f"建议: 1) 减少其他GPU进程的内存使用\n"
+                            f"      2) 使用更小的模型\n"
+                            f"      3) 使用CPU模式运行（通过--force_cpu参数）"
+                        )
+                        raise RuntimeError(error_msg) from retry_error
+                else:
+                    raise e
             
             # 移到指定设备并设置为评估模式
             try:
@@ -215,9 +312,30 @@ class EmbeddingExtractor:
                     # CPU设备
                     self.model = self.model.eval()
                     logger.info("模型在CPU上运行")
-            except Exception as e:
-                # 如果移至NPU失败，回退到GPU或CPU
-                if self.device.type == "npu":
+            except RuntimeError as e:
+                # 如果移至设备时内存不足，尝试强制释放后重试
+                if "CUDA out of memory" in str(e) and self.device.type == "cuda":
+                    logger.warning("将模型移至GPU时内存不足，尝试强制释放内存后重试...")
+                    # 强制释放GPU内存
+                    self._force_release_gpu_memory("cuda")
+                    # 再次尝试移动
+                    try:
+                        logger.info("强制释放内存后，再次尝试将模型移至GPU...")
+                        self.model = self.model.to(self.device)
+                        logger.info(f"模型已加载到{self.device}")
+                    except Exception as retry_error:
+                        logger.error(f"强制释放内存后仍然无法将模型移至GPU: {retry_error}")
+                        error_msg = (
+                            f"GPU内存不足，无法将模型移至GPU。已尝试强制释放内存但仍失败。\n"
+                            f"错误详情: {retry_error}\n"
+                            f"当前GPU内存使用: {self.get_gpu_memory_info()}\n"
+                            f"建议: 1) 减少其他GPU进程的内存使用\n"
+                            f"      2) 使用更小的模型\n"
+                            f"      3) 使用CPU模式运行（通过--force_cpu参数）"
+                        )
+                        raise RuntimeError(error_msg) from retry_error
+                # 如果移至NPU失败，回退到GPU或CPU（仅针对NPU错误）
+                elif self.device.type == "npu":
                     logger.error(f"将模型移至NPU失败: {str(e)}")
                     logger.info("尝试回退到GPU或CPU")
                     if torch.cuda.is_available():
@@ -296,51 +414,35 @@ class EmbeddingExtractor:
                             self.load_model()
                         except Exception as reload_error:
                             logger.error(f"重新加载模型失败: {reload_error}")
-                            # 如果GPU内存不足，尝试使用CPU
+                            # 如果GPU内存不足，尝试强制释放内存后重试
                             if "CUDA out of memory" in str(reload_error) and original_device.type == "cuda":
-                                logger.info("GPU内存不足，尝试切换到CPU...")
-                                # 释放所有GPU资源
-                                import gc
-                                if hasattr(self, 'model') and self.model is not None:
-                                    del self.model
-                                if hasattr(self, 'tokenizer'):
-                                    del self.tokenizer
-                                gc.collect()
-                                # 在切换设备前重置CUDA峰值内存统计
+                                logger.warning("GPU内存不足，尝试强制释放内存后重试...")
+                                # 强制释放GPU内存
+                                self._force_release_gpu_memory("cuda")
+                                # 再次尝试加载
                                 try:
-                                    cuda_device = torch.device("cuda:0")
-                                    torch.cuda.reset_peak_memory_stats(cuda_device)
-                                except:
-                                    pass
-                                torch.cuda.empty_cache()
-                                torch.cuda.ipc_collect()
-                                # 再次垃圾回收
-                                gc.collect()
-                                torch.cuda.empty_cache()
-                                # 切换到CPU
-                                self.device = torch.device("cpu")
-                                self.torch_dtype = torch.float16
-                                logger.info(f"已切换到CPU设备")
-                                self.load_model()
+                                    logger.info("强制释放内存后，再次尝试加载模型...")
+                                    self.load_model()
+                                except Exception as retry_error:
+                                    logger.error(f"强制释放内存后仍然无法加载模型: {retry_error}")
+                                    error_msg = (
+                                        f"GPU内存不足，无法加载模型。已尝试强制释放内存但仍失败。\n"
+                                        f"错误详情: {retry_error}\n"
+                                        f"当前GPU内存使用: {self.get_gpu_memory_info()}\n"
+                                        f"建议: 1) 减少其他GPU进程的内存使用\n"
+                                        f"      2) 使用更小的模型\n"
+                                        f"      3) 使用CPU模式运行（通过--force_cpu参数）"
+                                    )
+                                    raise RuntimeError(error_msg) from retry_error
                             else:
                                 raise reload_error
                         
-                        # 如果设备发生了变化，需要重新创建inputs并移动到新设备
-                        if original_device != self.device:
-                            logger.info(f"设备已从 {original_device} 切换到 {self.device}，重新创建inputs...")
-                            # 重新tokenize并移动到新设备
-                            inputs = self.tokenizer(sequence, return_tensors="pt")
-                            if self.device.type == "npu":
-                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                            elif self.device.type == "cuda":
-                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                            # CPU设备不需要移动
-                        else:
-                            # 设备未变化，但需要确保inputs在正确的设备上
-                            if self.device.type == "npu":
-                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                            elif self.device.type == "cuda":
-                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                        # 确保inputs在正确的设备上
+                        if self.device.type == "npu":
+                            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                        elif self.device.type == "cuda":
+                            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                        # CPU设备不需要移动
                         
                         # 再次尝试前向传播
                         outputs = self.model(**inputs)
