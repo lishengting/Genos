@@ -115,7 +115,7 @@ class EmbeddingExtractor:
             # 配置模型加载参数
             kwargs = dict(
                 output_hidden_states=True,
-                dtype=self.torch_dtype,
+                torch_dtype=self.torch_dtype,
                 trust_remote_code=True
             )
             
@@ -322,11 +322,13 @@ def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtyp
     # 模型配置（与embedding_extraction.py保持一致）
     model_configs = {
         "1.2B": {
-            "path": "./onehot-mix1b-4n-8k-315b-b1-256-tp1pp1ep1-iter_0157014",
+            #"path": "./onehot-mix1b-4n-8k-315b-b1-256-tp1pp1ep1-iter_0157014",
+            "path": "/storeData/AI_models/modelscope/hub/models/BGI-HangzhouAI/Genos-1.2B",
             "type": "flash",
         },
         "10B": {
-            "path": "./Mixtral_onehot_mix_10b_12L_16n_8k_eod_pai_211_0804_315B",
+            #"path": "./Mixtral_onehot_mix_10b_12L_16n_8k_eod_pai_211_0804_315B",
+            "path": "/storeData/AI_models/modelscope/hub/models/BGI-HangzhouAI/Genos-10B",
             "type": "flash",
         }
     }
