@@ -119,7 +119,7 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
     # 准备模型参数
     model_kwargs = {
         'output_hidden_states': True,
-        'torch_dtype': torch_dtype,  # 使用dtype代替已废弃的torch_dtype
+        'torch_dtype': torch_dtype,  # 不能使用dtype代替torch_dtype，旧版不支持
         'trust_remote_code': True
     }
     
@@ -210,20 +210,18 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         print(f"Layer {i} embedding ({layer_embedding.shape}): {layer_embedding[0, 0, :10]}")
         print("-" * 50)
         
-        # 根据设备类型处理tensor转换
-        # 不再需要try-except，直接使用PyTorch原生的device处理逻辑
-        if device.type == 'npu':
-            # 昇腾NPU: 先转换为CPU，再转为numpy
-            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
-        elif device.type == 'cuda':
-            # GPU: 可以直接转为numpy
-            embeddings_dict[f'layer_{i}'] = layer_embedding.numpy()
-        else:
-            # CPU: 检查数据类型并可能需要转换
-            if layer_embedding.dtype == torch.bfloat16:
-                print(f"注意: 在CPU上运行时将BFloat16转换为Float16")
-                layer_embedding = layer_embedding.to(torch.float16)
-            embeddings_dict[f'layer_{i}'] = layer_embedding.cpu().numpy()
+        # 所有设备类型都需要先将tensor移至CPU，再转换为numpy
+        # 无论是NPU、GPU还是CPU，先确保tensor在CPU上
+        cpu_tensor = layer_embedding.cpu()
+        
+        # 对于CPU上的tensor，可能需要处理特殊数据类型
+        if cpu_tensor.dtype == torch.bfloat16:
+            # BFloat16在某些环境中可能需要转换为Float16以确保兼容性
+            print(f"注意: 将BFloat16转换为Float16以确保更好的兼容性")
+            cpu_tensor = cpu_tensor.to(torch.float16)
+        
+        # 转换为numpy数组
+        embeddings_dict[f'layer_{i}'] = cpu_tensor.numpy()
     
     return embeddings_dict
 
