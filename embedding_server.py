@@ -101,9 +101,46 @@ class EmbeddingExtractor:
         self.model_name = model_name
         self.load_model()
         
+    def get_gpu_memory_info(self):
+        """获取GPU内存使用情况信息"""
+        if self.device.type == "cuda":
+            current_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            max_allocated = torch.cuda.max_memory_allocated(self.device) / 1024**3
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+            return f"当前GPU内存使用: {current_allocated:.2f}GB, 最大峰值: {max_allocated:.2f}GB, 保留内存: {reserved:.2f}GB"
+        return "不适用 (非CUDA设备)"
+    
     def load_model(self):
         """加载预训练模型和tokenizer"""
         try:
+            # 释放之前的模型资源，避免显存泄漏
+            if hasattr(self, 'model') and self.model is not None:
+                logger.info("释放之前的模型资源...")
+                
+                # 记录释放前的显存使用情况
+                if self.device.type == "cuda":
+                    logger.info(f"释放前 - {self.get_gpu_memory_info()}")
+                
+                # 删除模型并清空缓存
+                del self.model
+                # 强制Python垃圾回收
+                import gc
+                gc.collect()
+                
+                # 根据设备类型执行对应的缓存清理
+                if self.device.type == "cuda":
+                    # 执行多次显存清理操作以增强效果
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    # 再次垃圾回收
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    # 记录释放后的显存使用情况
+                    logger.info(f"释放后 - {self.get_gpu_memory_info()}")
+                elif self.device.type == "npu":
+                    torch.npu.empty_cache()
+                    gc.collect()
+            
             logger.info(f"加载模型 {self.model_path} 到 {self.device}，数据类型: {self.torch_dtype}...")
             
             # 加载tokenizer
@@ -219,7 +256,27 @@ class EmbeddingExtractor:
                         logger.info("正在重新加载模型，使用默认注意力实现...")
                         # 重新加载模型，使用默认注意力实现
                         self.model_type = "no_flash"
-                        self.load_model()
+                        try:
+                            self.load_model()
+                        except Exception as reload_error:
+                            logger.error(f"重新加载模型失败: {reload_error}")
+                            # 如果GPU内存不足，尝试使用CPU
+                            if "CUDA out of memory" in str(reload_error) and self.device.type == "cuda":
+                                logger.info("GPU内存不足，尝试切换到CPU...")
+                                # 释放所有GPU资源
+                                import gc
+                                if hasattr(self, 'model') and self.model is not None:
+                                    del self.model
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                                torch.cuda.ipc_collect()
+                                # 切换到CPU
+                                self.device = torch.device("cpu")
+                                self.torch_dtype = torch.float16
+                                logger.info(f"已切换到CPU设备")
+                                self.load_model()
+                            else:
+                                raise reload_error
                         # 再次尝试前向传播
                         outputs = self.model(**inputs)
                         # 根据设备类型同步
