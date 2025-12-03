@@ -217,7 +217,7 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         # 对于CPU上的tensor，可能需要处理特殊数据类型
         if cpu_tensor.dtype == torch.bfloat16:
             # BFloat16在某些环境中可能需要转换为Float16以确保兼容性
-            print(f"注意: 将BFloat16转换为Float16以确保更好的兼容性")
+            # print(f"注意: 将BFloat16转换为Float16以确保更好的兼容性")
             cpu_tensor = cpu_tensor.to(torch.float16)
         
         # 转换为numpy数组
