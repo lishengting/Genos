@@ -112,32 +112,65 @@ class EmbeddingExtractor:
     
     def load_model(self):
         """加载预训练模型和tokenizer"""
+        logger.info(f"开始加载模型，路径: {self.model_path}, 设备: {self.device}, 数据类型: {self.torch_dtype}, 模型类型: {self.model_type}")
         try:
             # 释放之前的模型资源，避免显存泄漏
             if hasattr(self, 'model') and self.model is not None:
                 logger.info("释放之前的模型资源...")
                 
+                # 记录原始设备类型，用于释放资源
+                original_device_type = None
+                if hasattr(self, 'model'):
+                    # 尝试获取模型所在的设备
+                    try:
+                        # 获取模型第一个参数所在的设备
+                        first_param = next(self.model.parameters())
+                        original_device_type = first_param.device.type
+                    except:
+                        # 如果无法获取，使用self.device
+                        original_device_type = self.device.type if hasattr(self, 'device') else None
+                
                 # 记录释放前的显存使用情况
-                if self.device.type == "cuda":
+                if original_device_type == "cuda":
                     logger.info(f"释放前 - {self.get_gpu_memory_info()}")
                 
-                # 删除模型并清空缓存
+                # 删除模型和tokenizer
                 del self.model
+                if hasattr(self, 'tokenizer'):
+                    del self.tokenizer
+                
                 # 强制Python垃圾回收
                 import gc
                 gc.collect()
                 
-                # 根据设备类型执行对应的缓存清理
-                if self.device.type == "cuda":
+                # 根据原始设备类型执行对应的缓存清理
+                if original_device_type == "cuda":
                     # 执行多次显存清理操作以增强效果
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
                     # 再次垃圾回收
                     gc.collect()
                     torch.cuda.empty_cache()
+                    # 重置峰值内存统计，以便更准确地观察内存释放
+                    # 获取CUDA设备对象
+                    cuda_device = None
+                    if hasattr(self, 'device') and self.device.type == "cuda":
+                        cuda_device = self.device
+                    else:
+                        # 尝试从原始设备获取，或使用默认cuda:0
+                        try:
+                            cuda_device = torch.device("cuda:0")
+                        except:
+                            pass
+                    if cuda_device is not None:
+                        torch.cuda.reset_peak_memory_stats(cuda_device)
                     # 记录释放后的显存使用情况
-                    logger.info(f"释放后 - {self.get_gpu_memory_info()}")
-                elif self.device.type == "npu":
+                    # 注意：如果设备已切换，get_gpu_memory_info可能不适用
+                    if hasattr(self, 'device') and self.device.type == "cuda":
+                        logger.info(f"释放后 - {self.get_gpu_memory_info()}")
+                    else:
+                        logger.info("释放后 - 设备已切换，无法获取GPU内存信息")
+                elif original_device_type == "npu":
                     torch.npu.empty_cache()
                     gc.collect()
             
@@ -218,6 +251,7 @@ class EmbeddingExtractor:
         Returns:
             dict: 包含embedding和相关信息的字典
         """
+        logger.info(f"开始提取embedding，序列长度: {len(sequence)}, 池化方法: {pooling_method}, 设备: {self.device}")
         try:
             import time
             start = time.time()
@@ -254,6 +288,8 @@ class EmbeddingExtractor:
                     if "FlashAttention" in str(e) and self.model_type == "flash":
                         logger.warning(f"FlashAttention不支持当前设备，错误: {e}")
                         logger.info("正在重新加载模型，使用默认注意力实现...")
+                        # 记录原始设备，用于后续判断是否需要重新创建inputs
+                        original_device = self.device
                         # 重新加载模型，使用默认注意力实现
                         self.model_type = "no_flash"
                         try:
@@ -261,15 +297,26 @@ class EmbeddingExtractor:
                         except Exception as reload_error:
                             logger.error(f"重新加载模型失败: {reload_error}")
                             # 如果GPU内存不足，尝试使用CPU
-                            if "CUDA out of memory" in str(reload_error) and self.device.type == "cuda":
+                            if "CUDA out of memory" in str(reload_error) and original_device.type == "cuda":
                                 logger.info("GPU内存不足，尝试切换到CPU...")
                                 # 释放所有GPU资源
                                 import gc
                                 if hasattr(self, 'model') and self.model is not None:
                                     del self.model
+                                if hasattr(self, 'tokenizer'):
+                                    del self.tokenizer
                                 gc.collect()
+                                # 在切换设备前重置CUDA峰值内存统计
+                                try:
+                                    cuda_device = torch.device("cuda:0")
+                                    torch.cuda.reset_peak_memory_stats(cuda_device)
+                                except:
+                                    pass
                                 torch.cuda.empty_cache()
                                 torch.cuda.ipc_collect()
+                                # 再次垃圾回收
+                                gc.collect()
+                                torch.cuda.empty_cache()
                                 # 切换到CPU
                                 self.device = torch.device("cpu")
                                 self.torch_dtype = torch.float16
@@ -277,6 +324,24 @@ class EmbeddingExtractor:
                                 self.load_model()
                             else:
                                 raise reload_error
+                        
+                        # 如果设备发生了变化，需要重新创建inputs并移动到新设备
+                        if original_device != self.device:
+                            logger.info(f"设备已从 {original_device} 切换到 {self.device}，重新创建inputs...")
+                            # 重新tokenize并移动到新设备
+                            inputs = self.tokenizer(sequence, return_tensors="pt")
+                            if self.device.type == "npu":
+                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                            elif self.device.type == "cuda":
+                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                            # CPU设备不需要移动
+                        else:
+                            # 设备未变化，但需要确保inputs在正确的设备上
+                            if self.device.type == "npu":
+                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                            elif self.device.type == "cuda":
+                                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                        
                         # 再次尝试前向传播
                         outputs = self.model(**inputs)
                         # 根据设备类型同步
@@ -344,7 +409,8 @@ class EmbeddingExtractor:
                 "device": str(self.device),
                 "embedding": embedding_array.tolist()  # 转换为列表便于JSON序列化
             }
-            logger.debug(f"处理时间: {time.time() - start:.4f}秒") 
+            processing_time = time.time() - start
+            logger.info(f"✅ Embedding提取成功，处理时间: {processing_time:.4f}秒，embedding维度: {embedding_array.shape}") 
             return result
             
         except Exception as e:
