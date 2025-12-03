@@ -204,13 +204,31 @@ class EmbeddingExtractor:
 
             # 前向传播获取embedding
             with torch.no_grad():
-                outputs = self.model(**inputs)
-                # 根据设备类型同步
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize()
-                elif self.device.type == "npu":
-                    # NPU也需要同步
-                    torch.npu.synchronize()
+                try:
+                    outputs = self.model(**inputs)
+                    # 根据设备类型同步
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize()
+                    elif self.device.type == "npu":
+                        # NPU也需要同步
+                        torch.npu.synchronize()
+                except RuntimeError as e:
+                    # 检查是否是FlashAttention错误
+                    if "FlashAttention" in str(e) and self.model_type == "flash":
+                        logger.warning(f"FlashAttention不支持当前设备，错误: {e}")
+                        logger.info("正在重新加载模型，使用默认注意力实现...")
+                        # 重新加载模型，使用默认注意力实现
+                        self.model_type = "no_flash"
+                        self.load_model()
+                        # 再次尝试前向传播
+                        outputs = self.model(**inputs)
+                        # 根据设备类型同步
+                        if self.device.type == "cuda":
+                            torch.cuda.synchronize()
+                        elif self.device.type == "npu":
+                            torch.npu.synchronize()
+                    else:
+                        raise e
             
             # 提取最后一层隐藏状态
             last_hidden_state = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_dim]
@@ -245,18 +263,17 @@ class EmbeddingExtractor:
                 raise ValueError(f"不支持的池化方法: {pooling_method}")
             
             # 根据设备类型处理tensor转换
-            if self.device.type == "npu":
-                # 昇腾NPU: 先转换为CPU，再转为numpy
-                embedding_array = pooled_embedding.cpu().numpy()
-            elif self.device.type == "cuda":
-                # GPU: 可以直接转为numpy
-                embedding_array = pooled_embedding.cpu().numpy()
-            else:
-                # CPU: 检查数据类型并可能需要转换
-                if pooled_embedding.dtype == torch.bfloat16:
-                    logger.warning(f"注意: 在CPU上运行时将BFloat16转换为Float16")
-                    pooled_embedding = pooled_embedding.to(torch.float16)
-                embedding_array = pooled_embedding.numpy()
+            # 先将tensor移至CPU
+            cpu_tensor = pooled_embedding.cpu()
+            
+            # 检查并转换BFloat16类型，确保更好的兼容性
+            if cpu_tensor.dtype == torch.bfloat16:
+                # BFloat16在某些环境中可能需要转换为Float16以确保兼容性
+                logger.warning(f"注意: 将BFloat16转换为Float16以确保更好的兼容性")
+                cpu_tensor = cpu_tensor.to(torch.float16)
+            
+            # 转换为numpy数组
+            embedding_array = cpu_tensor.numpy()
             
             # 构建返回结果
             result = {
