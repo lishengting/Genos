@@ -261,8 +261,8 @@ class EmbeddingExtractor:
                 trust_remote_code=True
             )
             
-            # Flash Attention优化（仅在GPU上启用）
-            if self.model_type == "flash" and self.device.type == "cuda":
+            # Flash Attention优化（在GPU和NPU上启用）
+            if self.model_type == "flash" and (self.device.type == "cuda" or self.device.type == "npu"):
                 logger.info("启用Flash Attention加速")
                 kwargs.update(dict(
                     attn_implementation="flash_attention_2"
