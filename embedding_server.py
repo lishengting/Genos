@@ -74,7 +74,7 @@ lock = asyncio.Lock()
 class EmbeddingExtractor:
     """Embedding提取器类，封装序列embedding提取逻辑"""
     
-    def __init__(self, model_path, model_type="flash", device=None, torch_dtype=None, model_name="1.2B", force_cpu=False, device_map=None):
+    def __init__(self, model_path, model_type="flash", device=None, torch_dtype=None, model_name="1.2B", force_cpu=False, device_map=None, memory_ratio=0.9):
         """
         初始化Embedding提取器
         
@@ -91,6 +91,7 @@ class EmbeddingExtractor:
                 - "sequential": 按顺序分配到设备
                 - dict: 手动指定每层的设备映射
                 - None: 使用单设备模式（device参数指定的设备）
+            memory_ratio (float): 内存分配比例，默认0.9（使用90%的内存）
         """
         # 如果未指定设备，则自动选择
         if device is None or torch_dtype is None:
@@ -121,6 +122,7 @@ class EmbeddingExtractor:
         self.model_path = model_path
         self.model_name = model_name
         self.device_map = device_map
+        self.memory_ratio = memory_ratio
         self.load_model()
         
     def _get_available_devices(self):
@@ -158,6 +160,89 @@ class EmbeddingExtractor:
             reserved = torch.cuda.memory_reserved(self.device) / 1024**3
             return f"当前GPU内存使用: {current_allocated:.2f}GB, 最大峰值: {max_allocated:.2f}GB, 保留内存: {reserved:.2f}GB"
         return "不适用 (非CUDA设备)"
+    
+    def _get_device_memory_gb(self, device_str):
+        """
+        获取指定设备的总内存大小（GB）
+        
+        Args:
+            device_str (str): 设备字符串，如 "cuda:0" 或 "npu:0"
+            
+        Returns:
+            float: 设备总内存大小（GB），如果无法获取则返回None
+        """
+        logger.info(f"获取设备 {device_str} 的内存大小...")
+        try:
+            device_obj = torch.device(device_str)
+            if device_obj.type == "cuda":
+                # CUDA设备
+                total_memory = torch.cuda.get_device_properties(device_obj).total_memory / 1024**3
+                logger.info(f"设备 {device_str} 总内存: {total_memory:.2f}GB")
+                return total_memory
+            elif device_obj.type == "npu":
+                # NPU设备
+                # 尝试获取NPU内存信息
+                try:
+                    # 方法1: 使用torch.npu.get_device_properties获取内存信息
+                    if hasattr(torch.npu, 'get_device_properties'):
+                        props = torch.npu.get_device_properties(device_obj)
+                        if hasattr(props, 'total_memory'):
+                            total_memory = props.total_memory / 1024**3
+                            logger.info(f"设备 {device_str} 总内存: {total_memory:.2f}GB")
+                            return total_memory
+                        # 有些版本可能使用其他属性名
+                        if hasattr(props, 'global_mem_size'):
+                            total_memory = props.global_mem_size / 1024**3
+                            logger.info(f"设备 {device_str} 总内存: {total_memory:.2f}GB")
+                            return total_memory
+                    # 方法2: 尝试使用torch.npu.max_memory_reserved获取（需要先分配一些内存）
+                    # 这个方法不太可靠，因为需要先分配内存
+                    # 方法3: 对于昇腾NPU 910B，通常有32GB内存
+                    # 如果无法获取，使用默认值32GB
+                    logger.warning(f"无法直接获取NPU {device_str} 的内存信息，使用默认值32GB")
+                    return 32.0  # 默认32GB，适用于昇腾NPU 910B
+                except Exception as e:
+                    logger.warning(f"获取NPU {device_str} 内存信息失败: {e}，使用默认值32GB")
+                    return 32.0  # 默认32GB
+            else:
+                # CPU或其他设备
+                logger.info(f"设备 {device_str} 是CPU，不限制内存")
+                return None
+        except Exception as e:
+            logger.warning(f"获取设备 {device_str} 内存信息时出错: {e}")
+            return None
+    
+    def _build_max_memory_dict(self, all_devices, specified_devices):
+        """
+        构建max_memory字典，用于限制设备使用
+        
+        Args:
+            all_devices (list): 所有可用设备列表
+            specified_devices (list): 用户指定的设备列表
+            
+        Returns:
+            dict: max_memory字典，格式如 {"cuda:0": "28GiB", "cuda:1": "0GiB"}
+        """
+        logger.info(f"构建max_memory字典，指定设备: {specified_devices}, 内存分配比例: {self.memory_ratio}")
+        max_memory = {}
+        for dev in all_devices:
+            if dev in specified_devices:
+                # 用户指定的设备，获取实际内存并乘以比例
+                total_memory_gb = self._get_device_memory_gb(dev)
+                if total_memory_gb is not None:
+                    # 计算分配的内存（GB）
+                    allocated_memory_gb = total_memory_gb * self.memory_ratio
+                    # 转换为GiB格式（1GB ≈ 0.931GiB，但通常直接使用GB值）
+                    max_memory[dev] = f"{allocated_memory_gb:.2f}GiB"
+                    logger.info(f"设备 {dev}: 总内存 {total_memory_gb:.2f}GB, 分配 {allocated_memory_gb:.2f}GB ({self.memory_ratio*100:.1f}%)")
+                else:
+                    # 如果无法获取内存信息，使用一个较大的默认值
+                    logger.warning(f"无法获取设备 {dev} 的内存信息，使用默认值 32GiB")
+                    max_memory[dev] = "32GiB"
+            else:
+                # 未指定的设备，设置为0，禁止使用
+                max_memory[dev] = "0GiB"
+        return max_memory
     
     def _force_release_gpu_memory(self, original_device_type):
         """
@@ -330,6 +415,14 @@ class EmbeddingExtractor:
                 if self.device_map == "auto":
                     logger.info("使用自动设备映射（device_map='auto'）")
                     kwargs['device_map'] = "auto"
+                    # 如果用户指定了设备列表，使用max_memory限制只使用指定的设备
+                    if self.multi_device and self.devices:
+                        # 获取所有可用设备
+                        all_devices = self._get_available_devices()
+                        # 构建max_memory字典：指定设备使用动态获取的内存乘以比例，其他设备设为0
+                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                        kwargs['max_memory'] = max_memory
+                        logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
                 elif self.device_map == "balanced":
                     # 平衡分配到所有设备
                     if self.multi_device:
@@ -339,6 +432,12 @@ class EmbeddingExtractor:
                         device_list = self._get_available_devices()
                     logger.info(f"使用平衡设备映射，分配到设备: {device_list}")
                     kwargs['device_map'] = "balanced"
+                    # 如果用户指定了设备列表，使用max_memory限制只使用指定的设备
+                    if self.multi_device and self.devices:
+                        all_devices = self._get_available_devices()
+                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                        kwargs['max_memory'] = max_memory
+                        logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
                 elif self.device_map == "sequential":
                     # 顺序分配到设备
                     if self.multi_device:
@@ -347,6 +446,12 @@ class EmbeddingExtractor:
                         device_list = self._get_available_devices()
                     logger.info(f"使用顺序设备映射，分配到设备: {device_list}")
                     kwargs['device_map'] = "sequential"
+                    # 如果用户指定了设备列表，使用max_memory限制只使用指定的设备
+                    if self.multi_device and self.devices:
+                        all_devices = self._get_available_devices()
+                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                        kwargs['max_memory'] = max_memory
+                        logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
                 elif isinstance(self.device_map, dict):
                     # 手动指定设备映射
                     logger.info(f"使用手动设备映射: {self.device_map}")
@@ -357,6 +462,14 @@ class EmbeddingExtractor:
                 # 多设备模式但没有指定device_map，使用自动分配
                 logger.info(f"多设备模式，使用自动设备映射分配到: {self.devices}")
                 kwargs['device_map'] = "auto"
+                # 使用max_memory限制只使用指定的设备
+                if self.devices:
+                    # 获取所有可用设备
+                    all_devices = self._get_available_devices()
+                    # 构建max_memory字典：指定设备使用动态获取的内存乘以比例，其他设备设为0
+                    max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                    kwargs['max_memory'] = max_memory
+                    logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
             
             # 加载模型
             try:
@@ -660,7 +773,7 @@ class EmbeddingExtractor:
 extractors = {}
 
 
-def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtype=None, device_map=None):
+def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtype=None, device_map=None, memory_ratio=0.9):
     """
     获取或创建指定模型的提取器
     
@@ -677,6 +790,7 @@ def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtyp
             - "sequential": 按顺序分配到设备
             - dict: 手动指定每层的设备映射
             - None: 使用单设备模式
+        memory_ratio (float): 内存分配比例，默认0.9（使用90%的内存）
         
     Returns:
         EmbeddingExtractor: 提取器实例
@@ -711,7 +825,8 @@ def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtyp
         torch_dtype=torch_dtype,
         model_name=model_name,
         force_cpu=force_cpu,
-        device_map=device_map
+        device_map=device_map,
+        memory_ratio=memory_ratio
     )
     extractors[model_name] = extractor
     
@@ -778,6 +893,7 @@ def run_server(args):
     force_cpu = args.force_cpu
     device = args.device if args.device else None
     device_map = args.device_map if args.device_map else None
+    memory_ratio = args.memory_ratio if hasattr(args, 'memory_ratio') else 0.9
     torch_dtype = None
     
     # 处理设备参数：如果device包含逗号，则转换为列表（多设备模式）
@@ -790,9 +906,9 @@ def run_server(args):
             logger.info(f"多设备模式下，自动使用 device_map='auto'")
     
     # 初始化模型提取器
-    logger.info(f"正在初始化模型提取器，强制CPU: {force_cpu}, 指定设备: {device}, device_map: {device_map}")
-    extractor = get_or_create_extractor("1.2B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype, device_map=device_map)
-    extractor = get_or_create_extractor("10B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype, device_map=device_map)
+    logger.info(f"正在初始化模型提取器，强制CPU: {force_cpu}, 指定设备: {device}, device_map: {device_map}, 内存分配比例: {memory_ratio}")
+    extractor = get_or_create_extractor("1.2B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype, device_map=device_map, memory_ratio=memory_ratio)
+    extractor = get_or_create_extractor("10B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype, device_map=device_map, memory_ratio=memory_ratio)
     
     # 启动服务器
     logger.info(f"正在启动服务器，监听地址: {args.host}:{args.port}")
@@ -820,6 +936,8 @@ def parse_arguments():
     parser.add_argument('--device_map', type=str, default=None,
                         help='设备映射方式: auto (自动分配), balanced (平衡分配), sequential (顺序分配)。'
                              '如果指定了多设备(--device)，将自动使用device_map="auto"')
+    parser.add_argument('--memory_ratio', type=float, default=0.9,
+                        help='内存分配比例，默认0.9（使用90%%的内存）。范围: 0.0-1.0')
     
     # 日志配置
     parser.add_argument('--log_level', type=str, default='INFO', 
