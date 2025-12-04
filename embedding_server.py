@@ -123,6 +123,7 @@ class EmbeddingExtractor:
         self.model_name = model_name
         self.device_map = device_map
         self.memory_ratio = memory_ratio
+        self._npu_manual_device_map = False  # 标记是否需要手动分配NPU设备
         self.load_model()
         
     def _get_available_devices(self):
@@ -221,11 +222,41 @@ class EmbeddingExtractor:
             specified_devices (list): 用户指定的设备列表
             
         Returns:
-            dict: max_memory字典，格式如 {"cuda:0": "28GiB", "cuda:1": "0GiB"}
+            dict: max_memory字典，格式如 {0: "28GiB", 1: "0GiB"}（使用整数索引）
+                 对于NPU设备，返回None（因为accelerate库不支持NPU设备名称）
         """
+        # 检查是否包含NPU设备
+        has_npu = any(dev.startswith('npu:') for dev in specified_devices + all_devices)
+        
+        if has_npu:
+            # NPU设备不支持max_memory参数，accelerate库只支持整数（GPU/XPU）、'mps'、'cpu'和'disk'
+            logger.warning("检测到NPU设备，max_memory参数不支持NPU设备名称，将使用device_map列表形式限制设备")
+            return None
+        
         logger.info(f"构建max_memory字典，指定设备: {specified_devices}, 内存分配比例: {self.memory_ratio}")
         max_memory = {}
+        
+        # 将设备字符串转换为整数索引，并构建映射
+        device_to_index = {}
         for dev in all_devices:
+            if dev.startswith('cuda:'):
+                # CUDA设备：提取索引
+                index = int(dev.split(':')[1])
+                device_to_index[dev] = index
+            elif dev.startswith('npu:'):
+                # NPU设备：提取索引（虽然NPU不支持，但为了完整性）
+                index = int(dev.split(':')[1])
+                device_to_index[dev] = index
+            else:
+                # 其他设备（如cpu），跳过
+                continue
+        
+        # 构建max_memory字典，使用整数索引
+        for dev in all_devices:
+            if dev not in device_to_index:
+                continue
+                
+            index = device_to_index[dev]
             if dev in specified_devices:
                 # 用户指定的设备，获取实际内存并乘以比例
                 total_memory_gb = self._get_device_memory_gb(dev)
@@ -233,16 +264,106 @@ class EmbeddingExtractor:
                     # 计算分配的内存（GB）
                     allocated_memory_gb = total_memory_gb * self.memory_ratio
                     # 转换为GiB格式（1GB ≈ 0.931GiB，但通常直接使用GB值）
-                    max_memory[dev] = f"{allocated_memory_gb:.2f}GiB"
-                    logger.info(f"设备 {dev}: 总内存 {total_memory_gb:.2f}GB, 分配 {allocated_memory_gb:.2f}GB ({self.memory_ratio*100:.1f}%)")
+                    max_memory[index] = f"{allocated_memory_gb:.2f}GiB"
+                    logger.info(f"设备 {dev} (索引 {index}): 总内存 {total_memory_gb:.2f}GB, 分配 {allocated_memory_gb:.2f}GB ({self.memory_ratio*100:.1f}%)")
                 else:
                     # 如果无法获取内存信息，使用一个较大的默认值
                     logger.warning(f"无法获取设备 {dev} 的内存信息，使用默认值 32GiB")
-                    max_memory[dev] = "32GiB"
+                    max_memory[index] = "32GiB"
             else:
                 # 未指定的设备，设置为0，禁止使用
-                max_memory[dev] = "0GiB"
+                max_memory[index] = "0GiB"
+                logger.info(f"设备 {dev} (索引 {index}): 设置为0GiB，禁止使用")
+        
         return max_memory
+    
+    def _manual_distribute_model_to_npu(self):
+        """
+        手动将模型分配到指定的NPU设备
+        对于NPU设备，由于accelerate库不支持max_memory，我们需要手动分配模型层
+        """
+        logger.info(f"开始手动分配模型到NPU设备: {self.devices}")
+        try:
+            # 获取模型的所有命名模块
+            named_modules = dict(self.model.named_modules())
+            
+            # 计算每个设备应该分配的层数
+            num_devices = len(self.devices)
+            
+            # 获取所有需要分配的层（通常是transformer的层）
+            layers_to_distribute = []
+            for name, module in named_modules.items():
+                # 识别transformer层（通常包含layer、block等关键字）
+                if any(keyword in name.lower() for keyword in ['layer', 'block', 'transformer']):
+                    # 排除顶层模块，只选择实际的层
+                    if '.' in name and not name.startswith('model.'):
+                        layers_to_distribute.append((name, module))
+            
+            # 如果找不到合适的层，尝试使用model.layers或model.blocks等
+            if not layers_to_distribute:
+                # 尝试直接访问model.layers或model.blocks
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                    layers = self.model.model.layers
+                    for i, layer in enumerate(layers):
+                        layers_to_distribute.append((f'model.layers.{i}', layer))
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'blocks'):
+                    blocks = self.model.model.blocks
+                    for i, block in enumerate(blocks):
+                        layers_to_distribute.append((f'model.blocks.{i}', block))
+                else:
+                    # 如果还是找不到，使用所有命名模块（排除顶层）
+                    layers_to_distribute = [(name, module) for name, module in named_modules.items() 
+                                          if '.' in name and name.count('.') >= 2]
+            
+            if not layers_to_distribute:
+                # 如果仍然找不到层，直接分配到第一个设备
+                logger.warning("无法识别模型层结构，将整个模型分配到第一个设备")
+                device_obj = torch.device(self.devices[0])
+                self.model = self.model.to(device_obj)
+                logger.info(f"模型已分配到设备: {self.devices[0]}")
+                return
+            
+            # 按设备分配层
+            layers_per_device = len(layers_to_distribute) // num_devices
+            remainder = len(layers_to_distribute) % num_devices
+            
+            current_idx = 0
+            for device_idx, device_str in enumerate(self.devices):
+                device_obj = torch.device(device_str)
+                # 计算这个设备应该分配的层数
+                num_layers = layers_per_device + (1 if device_idx < remainder else 0)
+                end_idx = current_idx + num_layers
+                
+                # 分配层到这个设备
+                for layer_name, layer_module in layers_to_distribute[current_idx:end_idx]:
+                    try:
+                        layer_module.to(device_obj)
+                        logger.debug(f"层 {layer_name} 已分配到 {device_str}")
+                    except Exception as e:
+                        logger.warning(f"将层 {layer_name} 分配到 {device_str} 失败: {e}")
+                
+                current_idx = end_idx
+                logger.info(f"设备 {device_str} 已分配 {num_layers} 层")
+            
+            # 将embedding和输出层分配到第一个设备
+            first_device = torch.device(self.devices[0])
+            for name, module in named_modules.items():
+                if any(keyword in name.lower() for keyword in ['embedding', 'embeddings', 'lm_head', 'head']):
+                    try:
+                        module.to(first_device)
+                        logger.debug(f"模块 {name} 已分配到 {self.devices[0]}")
+                    except Exception as e:
+                        logger.warning(f"将模块 {name} 分配到 {self.devices[0]} 失败: {e}")
+            
+            logger.info(f"✅ 模型已手动分配到NPU设备: {self.devices}")
+        except Exception as e:
+            logger.error(f"手动分配模型到NPU设备失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # 如果手动分配失败，回退到第一个设备
+            logger.warning(f"回退到第一个设备: {self.devices[0]}")
+            device_obj = torch.device(self.devices[0])
+            self.model = self.model.to(device_obj)
     
     def _force_release_gpu_memory(self, original_device_type):
         """
@@ -414,15 +535,30 @@ class EmbeddingExtractor:
                 # 使用device_map进行模型并行
                 if self.device_map == "auto":
                     logger.info("使用自动设备映射（device_map='auto'）")
-                    kwargs['device_map'] = "auto"
-                    # 如果用户指定了设备列表，使用max_memory限制只使用指定的设备
+                    # 如果用户指定了设备列表，需要限制只使用指定的设备
                     if self.multi_device and self.devices:
-                        # 获取所有可用设备
-                        all_devices = self._get_available_devices()
-                        # 构建max_memory字典：指定设备使用动态获取的内存乘以比例，其他设备设为0
-                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
-                        kwargs['max_memory'] = max_memory
-                        logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
+                        # 检查是否包含NPU设备
+                        has_npu = any(dev.startswith('npu:') for dev in self.devices)
+                        if has_npu:
+                            # NPU设备不支持max_memory，accelerate库无法识别NPU设备名称
+                            # 对于NPU多设备，我们需要使用其他方法
+                            # 方法：不使用device_map，先加载到CPU，然后手动分配到指定设备
+                            logger.warning(f"NPU设备不支持max_memory参数，将先加载到CPU，然后手动分配到指定设备: {self.devices}")
+                            # 不设置device_map，先加载到CPU
+                            kwargs.pop('device_map', None)  # 确保不设置device_map
+                            self._npu_manual_device_map = True  # 标记需要手动分配
+                        else:
+                            # CUDA设备可以使用max_memory
+                            all_devices = self._get_available_devices()
+                            max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                            if max_memory is not None:
+                                kwargs['max_memory'] = max_memory
+                                kwargs['device_map'] = "auto"
+                                logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
+                            else:
+                                kwargs['device_map'] = "auto"
+                    else:
+                        kwargs['device_map'] = "auto"
                 elif self.device_map == "balanced":
                     # 平衡分配到所有设备
                     if self.multi_device:
@@ -432,12 +568,25 @@ class EmbeddingExtractor:
                         device_list = self._get_available_devices()
                     logger.info(f"使用平衡设备映射，分配到设备: {device_list}")
                     kwargs['device_map'] = "balanced"
-                    # 如果用户指定了设备列表，使用max_memory限制只使用指定的设备
+                    # 如果用户指定了设备列表，需要限制只使用指定的设备
                     if self.multi_device and self.devices:
-                        all_devices = self._get_available_devices()
-                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
-                        kwargs['max_memory'] = max_memory
-                        logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
+                        # 检查是否包含NPU设备
+                        has_npu = any(dev.startswith('npu:') for dev in self.devices)
+                        if has_npu:
+                            # NPU设备不支持max_memory，accelerate库无法识别NPU设备名称
+                            # 对于NPU多设备，我们需要使用其他方法
+                            # 方法：不使用device_map，先加载到CPU，然后手动分配到指定设备
+                            logger.warning(f"NPU设备不支持max_memory参数，将先加载到CPU，然后手动分配到指定设备: {self.devices}")
+                            # 不设置device_map，先加载到CPU
+                            kwargs.pop('device_map', None)  # 确保不设置device_map
+                            self._npu_manual_device_map = True  # 标记需要手动分配
+                        else:
+                            # CUDA设备可以使用max_memory
+                            all_devices = self._get_available_devices()
+                            max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                            if max_memory is not None:
+                                kwargs['max_memory'] = max_memory
+                                logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
                 elif self.device_map == "sequential":
                     # 顺序分配到设备
                     if self.multi_device:
@@ -446,12 +595,25 @@ class EmbeddingExtractor:
                         device_list = self._get_available_devices()
                     logger.info(f"使用顺序设备映射，分配到设备: {device_list}")
                     kwargs['device_map'] = "sequential"
-                    # 如果用户指定了设备列表，使用max_memory限制只使用指定的设备
+                    # 如果用户指定了设备列表，需要限制只使用指定的设备
                     if self.multi_device and self.devices:
-                        all_devices = self._get_available_devices()
-                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
-                        kwargs['max_memory'] = max_memory
-                        logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
+                        # 检查是否包含NPU设备
+                        has_npu = any(dev.startswith('npu:') for dev in self.devices)
+                        if has_npu:
+                            # NPU设备不支持max_memory，accelerate库无法识别NPU设备名称
+                            # 对于NPU多设备，我们需要使用其他方法
+                            # 方法：不使用device_map，先加载到CPU，然后手动分配到指定设备
+                            logger.warning(f"NPU设备不支持max_memory参数，将先加载到CPU，然后手动分配到指定设备: {self.devices}")
+                            # 不设置device_map，先加载到CPU
+                            kwargs.pop('device_map', None)  # 确保不设置device_map
+                            self._npu_manual_device_map = True  # 标记需要手动分配
+                        else:
+                            # CUDA设备可以使用max_memory
+                            all_devices = self._get_available_devices()
+                            max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                            if max_memory is not None:
+                                kwargs['max_memory'] = max_memory
+                                logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
                 elif isinstance(self.device_map, dict):
                     # 手动指定设备映射
                     logger.info(f"使用手动设备映射: {self.device_map}")
@@ -464,12 +626,23 @@ class EmbeddingExtractor:
                 kwargs['device_map'] = "auto"
                 # 使用max_memory限制只使用指定的设备
                 if self.devices:
-                    # 获取所有可用设备
-                    all_devices = self._get_available_devices()
-                    # 构建max_memory字典：指定设备使用动态获取的内存乘以比例，其他设备设为0
-                    max_memory = self._build_max_memory_dict(all_devices, self.devices)
-                    kwargs['max_memory'] = max_memory
-                    logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
+                    # 检查是否包含NPU设备
+                    has_npu = any(dev.startswith('npu:') for dev in self.devices)
+                    if has_npu:
+                        # NPU设备不支持max_memory，accelerate库无法识别NPU设备名称
+                        # 对于NPU多设备，我们需要使用其他方法
+                        # 方法：不使用device_map，先加载到CPU，然后手动分配到指定设备
+                        logger.warning(f"NPU设备不支持max_memory参数，将先加载到CPU，然后手动分配到指定设备: {self.devices}")
+                        # 不设置device_map，先加载到CPU
+                        kwargs.pop('device_map', None)  # 确保不设置device_map
+                        self._npu_manual_device_map = True  # 标记需要手动分配
+                    else:
+                        # CUDA设备可以使用max_memory
+                        all_devices = self._get_available_devices()
+                        max_memory = self._build_max_memory_dict(all_devices, self.devices)
+                        if max_memory is not None:
+                            kwargs['max_memory'] = max_memory
+                            logger.info(f"限制设备使用，只使用指定设备: {self.devices}, max_memory: {max_memory}")
             
             # 加载模型
             try:
@@ -501,7 +674,12 @@ class EmbeddingExtractor:
             
             # 移到指定设备并设置为评估模式
             # 注意：如果使用了device_map，模型已经在加载时分配到各个设备，不需要再移动
-            if self.device_map is not None or self.multi_device:
+            if self._npu_manual_device_map:
+                # NPU多设备模式，需要手动分配模型到指定设备
+                logger.info(f"手动分配NPU模型到指定设备: {self.devices}")
+                self._manual_distribute_model_to_npu()
+                self.model.eval()
+            elif self.device_map is not None or self.multi_device:
                 # 多设备模式，模型已经通过device_map分配到各个设备
                 logger.info(f"模型已通过device_map分配到多个设备")
                 # 设置为评估模式
