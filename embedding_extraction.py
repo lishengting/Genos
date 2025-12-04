@@ -44,6 +44,11 @@ def parse_arguments():
     parser.add_argument('--output_file', type=str, default=None, help='embedding输出文件名')
     parser.add_argument('--use_flash_attention', action='store_true', help='是否使用Flash Attention加速（需要安装flash_attn包）')
     parser.add_argument('--use_cpu', action='store_true', help='强制使用CPU进行推理，不使用NPU或GPU')
+    parser.add_argument('--device', type=str, default=None, 
+                        help='指定运行设备。单设备: npu:0, cuda:0, cpu。多设备: 用逗号分隔，如 "cuda:0,cuda:1" 或 "npu:0,npu:1"')
+    parser.add_argument('--device_map', type=str, default=None,
+                        help='设备映射方式: auto (自动分配), balanced (平衡分配), sequential (顺序分配)。'
+                             '如果指定了多设备(--device)，将自动使用device_map="auto"')
     
     # API模式参数
     parser.add_argument('--token', type=str, default=None, help='Genos API密钥')
@@ -67,7 +72,34 @@ def generate_random_dna_sequence(length=8192):
     seqs = random.choices(bases, k=length)
     return ''.join(seqs)
 
-def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=False):
+def get_available_devices():
+    """
+    获取可用的设备列表
+    
+    Returns:
+        list: 可用设备列表，如 ["cuda:0", "cuda:1"] 或 ["npu:0", "npu:1"]
+    """
+    devices = []
+    
+    # 检查NPU
+    try:
+        if torch.npu.is_available():
+            npu_count = torch.npu.device_count()
+            devices.extend([f"npu:{i}" for i in range(npu_count)])
+    except:
+        pass
+    
+    # 检查CUDA
+    if torch.cuda.is_available():
+        cuda_count = torch.cuda.device_count()
+        devices.extend([f"cuda:{i}" for i in range(cuda_count)])
+    
+    if not devices:
+        devices = ["cpu"]
+    
+    return devices
+
+def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=False, device=None, device_map=None):
     """
     加载预训练模型和分词器
     
@@ -75,9 +107,18 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
         model_path: 本地模型路径
         use_flash_attention: 是否使用Flash Attention加速
         use_cpu: 是否强制使用CPU（忽略NPU和GPU）
+        device (str or list, optional): 设备类型，如果为None则自动选择
+            - 单设备: "cuda:0" 或 "npu:0"
+            - 多设备: ["cuda:0", "cuda:1"] 或 ["npu:0", "npu:1"]
+        device_map (str or dict, optional): 设备映射方式
+            - "auto": 自动分配模型到可用设备
+            - "balanced": 平衡分配到所有设备
+            - "sequential": 按顺序分配到设备
+            - dict: 手动指定每层的设备映射
+            - None: 使用单设备模式
     
     Returns:
-        tuple: (tokenizer, model)
+        tuple: (tokenizer, model, device)
     """
     print(f"正在加载模型: {model_path}")
     
@@ -85,15 +126,16 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
     # 确定运行设备和数据类型
-    device = None
     torch_dtype = None
+    multi_device = False
     
     # 如果强制使用CPU
     if use_cpu:
         device = "cpu"
         torch_dtype = torch.float16
         print("强制使用CPU进行推理")
-    else:
+    elif device is None:
+        # 自动选择设备
         # 优先检查NPU
         try:
             if torch.npu.is_available():
@@ -103,18 +145,41 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
         except Exception as e:
             print(f"检测NPU时出错: {str(e)}")
             device = None
-    
-    # 如果NPU不可用或强制CPU不启用，尝试使用GPU
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda:0"
-            torch_dtype = torch.bfloat16
-            print("使用NVIDIA GPU进行推理")
-        else:
-            # 使用CPU作为最后的备选
-            device = "cpu"
-            print("注意: 未检测到可用的GPU，使用CPU进行推理")
-            torch_dtype = torch.float16
+        
+        # 如果NPU不可用或强制CPU不启用，尝试使用GPU
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda:0"
+                torch_dtype = torch.bfloat16
+                print("使用NVIDIA GPU进行推理")
+            else:
+                # 使用CPU作为最后的备选
+                device = "cpu"
+                print("注意: 未检测到可用的GPU，使用CPU进行推理")
+                torch_dtype = torch.float16
+    else:
+        # 使用指定的设备
+        if isinstance(device, list):
+            # 多设备模式
+            multi_device = True
+            print(f"多设备模式: 使用设备 {device}")
+            # 根据第一个设备确定数据类型
+            first_device = device[0]
+            if first_device.startswith("npu"):
+                torch_dtype = torch.float16
+            elif first_device.startswith("cuda"):
+                torch_dtype = torch.bfloat16
+            else:
+                torch_dtype = torch.float16
+        elif isinstance(device, str):
+            # 单设备模式
+            if device.startswith("npu"):
+                torch_dtype = torch.float16
+            elif device.startswith("cuda"):
+                torch_dtype = torch.bfloat16
+            else:
+                torch_dtype = torch.float16
+            print(f"使用指定设备: {device}")
     
     # 准备模型参数
     model_kwargs = {
@@ -123,45 +188,96 @@ def load_model_and_tokenizer(model_path, use_flash_attention=False, use_cpu=Fals
         'trust_remote_code': True
     }
     
-    # 如果启用了Flash Attention且使用GPU，则添加相应参数
-    if use_flash_attention and (device.startswith("cuda") or device.startswith("npu")):
-        print("启用Flash Attention加速")
-        model_kwargs['attn_implementation'] = "flash_attention_2"
+    # 处理多设备映射
+    if device_map is not None:
+        # 使用device_map进行模型并行
+        if device_map == "auto":
+            print("使用自动设备映射（device_map='auto'）")
+            model_kwargs['device_map'] = "auto"
+        elif device_map == "balanced":
+            # 平衡分配到所有设备
+            if multi_device:
+                device_list = device
+            else:
+                # 自动检测可用设备
+                device_list = get_available_devices()
+            print(f"使用平衡设备映射，分配到设备: {device_list}")
+            model_kwargs['device_map'] = "balanced"
+        elif device_map == "sequential":
+            # 顺序分配到设备
+            if multi_device:
+                device_list = device
+            else:
+                device_list = get_available_devices()
+            print(f"使用顺序设备映射，分配到设备: {device_list}")
+            model_kwargs['device_map'] = "sequential"
+        elif isinstance(device_map, dict):
+            # 手动指定设备映射
+            print(f"使用手动设备映射: {device_map}")
+            model_kwargs['device_map'] = device_map
+        else:
+            print(f"不支持的device_map值: {device_map}，使用单设备模式")
+    elif multi_device:
+        # 多设备模式但没有指定device_map，使用自动分配
+        print(f"多设备模式，使用自动设备映射分配到: {device}")
+        model_kwargs['device_map'] = "auto"
+    
+    # Flash Attention优化（在GPU和NPU上启用）
+    # 注意：多设备模式下，Flash Attention可能不支持，需要检查
+    if use_flash_attention:
+        device_str = device if isinstance(device, str) else device[0] if isinstance(device, list) else str(device)
+        if (device_str.startswith("cuda") or device_str.startswith("npu")):
+            # 多设备模式下，Flash Attention可能不支持，使用默认实现
+            if multi_device or device_map is not None:
+                print("多设备模式下，Flash Attention可能不支持，使用默认注意力实现")
+            else:
+                print("启用Flash Attention加速")
+                model_kwargs['attn_implementation'] = "flash_attention_2"
+        else:
+            print("使用默认注意力实现")
     else:
         print("使用默认注意力实现")
     
     # 加载模型
     model = AutoModel.from_pretrained(model_path, **model_kwargs)
     
-    # 将模型移至相应设备
-    # 将模型移至相应设备
-    try:
-        if device.startswith("npu"):
-            model = model.to(device)
-            print(f"模型已成功加载到{device}")
-        elif device.startswith("cuda"):
-            model = model.to(device)
-            print(f"模型已加载到{device}")
-        else:
-            print("模型在CPU上运行")
-    except Exception as e:
-        # 如果移至NPU失败，回退到GPU或CPU
-        if device.startswith("npu"):
-            print(f"将模型移至NPU失败: {str(e)}")
-            print("尝试回退到GPU或CPU")
-            if torch.cuda.is_available():
-                device = "cuda:0"
+    # 移到指定设备并设置为评估模式
+    # 注意：如果使用了device_map，模型已经在加载时分配到各个设备，不需要再移动
+    if device_map is not None or multi_device:
+        # 多设备模式，模型已经通过device_map分配到各个设备
+        print(f"模型已通过device_map分配到多个设备")
+        # 设置为评估模式
+        model.eval()
+    else:
+        # 单设备模式，需要手动移动模型
+        try:
+            device_str = device if isinstance(device, str) else str(device)
+            if device_str.startswith("npu"):
                 model = model.to(device)
-                print(f"模型已回退到{device}")
+                print(f"模型已成功加载到{device}")
+            elif device_str.startswith("cuda"):
+                model = model.to(device)
+                print(f"模型已加载到{device}")
             else:
                 print("模型在CPU上运行")
+        except Exception as e:
+            # 如果移至NPU失败，回退到GPU或CPU
+            if device_str.startswith("npu"):
+                print(f"将模型移至NPU失败: {str(e)}")
+                print("尝试回退到GPU或CPU")
+                if torch.cuda.is_available():
+                    device = "cuda:0"
+                    model = model.to(device)
+                    print(f"模型已回退到{device}")
+                else:
+                    print("模型在CPU上运行")
+        
+        # 设置为评估模式
+        model.eval()
     
-    # 设置为评估模式
-    model.eval()
-    
-    return tokenizer, model
+    return tokenizer, model, device
 
-def extract_embeddings_locally(model, tokenizer, sequence):
+def extract_embeddings_locally(model, tokenizer, sequence, device=None):
     """
     使用本地模型提取embedding
     
@@ -169,6 +285,7 @@ def extract_embeddings_locally(model, tokenizer, sequence):
         model: 预训练模型
         tokenizer: 分词器
         sequence: DNA序列
+        device: 设备（用于多设备模式时确定主设备）
     
     Returns:
         dict: 包含各层embedding的字典
@@ -176,13 +293,22 @@ def extract_embeddings_locally(model, tokenizer, sequence):
     print("正在提取embedding...")
     
     # 确定运行设备
-    device = next(model.parameters()).device
+    # 如果是多设备模式，使用传入的device参数（主设备）
+    # 否则从模型参数获取设备
+    if device is None:
+        device = next(model.parameters()).device
+    elif isinstance(device, list):
+        # 多设备模式，使用第一个设备作为主设备
+        device = torch.device(device[0])
+    elif isinstance(device, str):
+        device = torch.device(device)
     
     # 编码序列
     inputs = tokenizer(sequence, return_tensors="pt")
     
     # 将数据移至相应设备
-    # 将数据移至相应设备
+    # 在多设备模式下，inputs需要移动到主设备（第一个设备）
+    # 模型内部会根据device_map自动处理数据在不同设备间的传输
     try:
         if device.type == 'npu':
             # 昇腾NPU设备
@@ -200,6 +326,26 @@ def extract_embeddings_locally(model, tokenizer, sequence):
     # 模型推理
     with torch.no_grad():
         outputs = model(**inputs)
+        
+        # 根据设备类型同步
+        # 多设备模式下，需要同步所有使用的设备
+        if isinstance(device, list) or (hasattr(model, 'hf_device_map') and model.hf_device_map):
+            # 多设备模式，同步所有设备
+            if hasattr(model, 'hf_device_map'):
+                devices_to_sync = set(model.hf_device_map.values())
+            else:
+                devices_to_sync = set(device)
+            for dev_str in devices_to_sync:
+                if isinstance(dev_str, str):
+                    dev_obj = torch.device(dev_str)
+                    if dev_obj.type == "cuda":
+                        torch.cuda.synchronize(dev_obj)
+                    elif dev_obj.type == "npu":
+                        torch.npu.synchronize(dev_obj)
+        elif device.type == "cuda":
+            torch.cuda.synchronize()
+        elif device.type == "npu":
+            torch.npu.synchronize()
     
     # 获取所有层的隐藏状态
     hidden_states = outputs.hidden_states
@@ -310,11 +456,28 @@ def main():
             print("错误: 本地模型模式需要提供model_path")
             return
         
+        # 处理设备参数：如果device包含逗号，则转换为列表（多设备模式）
+        device = args.device
+        device_map = args.device_map
+        if device and ',' in device:
+            device = [d.strip() for d in device.split(',')]
+            print(f"检测到多设备模式: {device}")
+            # 如果指定了多设备但没有指定device_map，默认使用auto
+            if device_map is None:
+                device_map = "auto"
+                print(f"多设备模式下，自动使用 device_map='auto'")
+        
         # 加载模型和分词器
-        tokenizer, model = load_model_and_tokenizer(args.model_path, args.use_flash_attention, args.use_cpu)
+        tokenizer, model, device = load_model_and_tokenizer(
+            args.model_path, 
+            args.use_flash_attention, 
+            args.use_cpu,
+            device=device,
+            device_map=device_map
+        )
         
         # 提取embedding
-        embeddings = extract_embeddings_locally(model, tokenizer, sequence)
+        embeddings = extract_embeddings_locally(model, tokenizer, sequence, device=device)
         
         # 保存结果
         save_embeddings(embeddings, args.output_file)

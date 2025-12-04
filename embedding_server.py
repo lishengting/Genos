@@ -74,17 +74,23 @@ lock = asyncio.Lock()
 class EmbeddingExtractor:
     """Embedding提取器类，封装序列embedding提取逻辑"""
     
-    def __init__(self, model_path, model_type="flash", device=None, torch_dtype=None, model_name="1.2B", force_cpu=False):
+    def __init__(self, model_path, model_type="flash", device=None, torch_dtype=None, model_name="1.2B", force_cpu=False, device_map=None):
         """
         初始化Embedding提取器
         
         Args:
             model_path (str): 模型路径
             model_type (str): 模型类型，"flash" 或 "no_flash"
-            device (str, optional): 设备类型，如果为None则自动选择
+            device (str, optional): 设备类型，如果为None则自动选择。支持单设备（如"cuda:0"）或多设备列表（如["cuda:0", "cuda:1"]）
             torch_dtype (torch.dtype, optional): 数据类型，如果为None则根据设备自动选择
             model_name (str): 模型名称
             force_cpu (bool): 是否强制使用CPU
+            device_map (str or dict, optional): 设备映射方式
+                - "auto": 自动分配模型到可用设备
+                - "balanced": 平衡分配到所有设备
+                - "sequential": 按顺序分配到设备
+                - dict: 手动指定每层的设备映射
+                - None: 使用单设备模式（device参数指定的设备）
         """
         # 如果未指定设备，则自动选择
         if device is None or torch_dtype is None:
@@ -93,14 +99,57 @@ class EmbeddingExtractor:
                 device = auto_device
             if torch_dtype is None:
                 torch_dtype = auto_dtype
-                
-        self.device = torch.device(device)
+        
+        # 处理设备参数：支持单设备字符串或多设备列表
+        if isinstance(device, str):
+            self.device = torch.device(device)
+            self.devices = [device]  # 设备列表，用于多设备模式
+            self.multi_device = False
+        elif isinstance(device, list):
+            # 多设备模式
+            self.devices = device
+            self.device = torch.device(device[0])  # 主设备
+            self.multi_device = True
+            logger.info(f"多设备模式: 使用设备 {self.devices}")
+        else:
+            self.device = torch.device(device)
+            self.devices = [str(device)]
+            self.multi_device = False
+            
         self.torch_dtype = torch_dtype
         self.model_type = model_type
         self.model_path = model_path
         self.model_name = model_name
+        self.device_map = device_map
         self.load_model()
         
+    def _get_available_devices(self):
+        """
+        获取可用的设备列表
+        
+        Returns:
+            list: 可用设备列表，如 ["cuda:0", "cuda:1"] 或 ["npu:0", "npu:1"]
+        """
+        devices = []
+        
+        # 检查NPU
+        try:
+            if torch.npu.is_available():
+                npu_count = torch.npu.device_count()
+                devices.extend([f"npu:{i}" for i in range(npu_count)])
+        except:
+            pass
+        
+        # 检查CUDA
+        if torch.cuda.is_available():
+            cuda_count = torch.cuda.device_count()
+            devices.extend([f"cuda:{i}" for i in range(cuda_count)])
+        
+        if not devices:
+            devices = ["cpu"]
+        
+        return devices
+    
     def get_gpu_memory_info(self):
         """获取GPU内存使用情况信息"""
         if self.device.type == "cuda":
@@ -262,13 +311,52 @@ class EmbeddingExtractor:
             )
             
             # Flash Attention优化（在GPU和NPU上启用）
+            # 注意：多设备模式下，Flash Attention可能不支持，需要检查
             if self.model_type == "flash" and (self.device.type == "cuda" or self.device.type == "npu"):
-                logger.info("启用Flash Attention加速")
-                kwargs.update(dict(
-                    attn_implementation="flash_attention_2"
-                ))
+                # 多设备模式下，Flash Attention可能不支持，使用默认实现
+                if self.multi_device or self.device_map is not None:
+                    logger.warning("多设备模式下，Flash Attention可能不支持，使用默认注意力实现")
+                else:
+                    logger.info("启用Flash Attention加速")
+                    kwargs.update(dict(
+                        attn_implementation="flash_attention_2"
+                    ))
             else:
                 logger.info("使用默认注意力实现")
+            
+            # 处理多设备映射
+            if self.device_map is not None:
+                # 使用device_map进行模型并行
+                if self.device_map == "auto":
+                    logger.info("使用自动设备映射（device_map='auto'）")
+                    kwargs['device_map'] = "auto"
+                elif self.device_map == "balanced":
+                    # 平衡分配到所有设备
+                    if self.multi_device:
+                        device_list = self.devices
+                    else:
+                        # 自动检测可用设备
+                        device_list = self._get_available_devices()
+                    logger.info(f"使用平衡设备映射，分配到设备: {device_list}")
+                    kwargs['device_map'] = "balanced"
+                elif self.device_map == "sequential":
+                    # 顺序分配到设备
+                    if self.multi_device:
+                        device_list = self.devices
+                    else:
+                        device_list = self._get_available_devices()
+                    logger.info(f"使用顺序设备映射，分配到设备: {device_list}")
+                    kwargs['device_map'] = "sequential"
+                elif isinstance(self.device_map, dict):
+                    # 手动指定设备映射
+                    logger.info(f"使用手动设备映射: {self.device_map}")
+                    kwargs['device_map'] = self.device_map
+                else:
+                    logger.warning(f"不支持的device_map值: {self.device_map}，使用单设备模式")
+            elif self.multi_device:
+                # 多设备模式但没有指定device_map，使用自动分配
+                logger.info(f"多设备模式，使用自动设备映射分配到: {self.devices}")
+                kwargs['device_map'] = "auto"
             
             # 加载模型
             try:
@@ -299,55 +387,63 @@ class EmbeddingExtractor:
                     raise e
             
             # 移到指定设备并设置为评估模式
-            try:
-                if self.device.type == "npu":
-                    # 昇腾NPU设备
-                    self.model = self.model.to(self.device)
-                    logger.info(f"模型已成功加载到{self.device}")
-                elif self.device.type == "cuda":
-                    # GPU设备
-                    self.model = self.model.to(self.device)
-                    logger.info(f"模型已加载到{self.device}")
-                else:
-                    # CPU设备
-                    self.model = self.model.eval()
-                    logger.info("模型在CPU上运行")
-            except RuntimeError as e:
-                # 如果移至设备时内存不足，尝试强制释放后重试
-                if "CUDA out of memory" in str(e) and self.device.type == "cuda":
-                    logger.warning("将模型移至GPU时内存不足，尝试强制释放内存后重试...")
-                    # 强制释放GPU内存
-                    self._force_release_gpu_memory("cuda")
-                    # 再次尝试移动
-                    try:
-                        logger.info("强制释放内存后，再次尝试将模型移至GPU...")
+            # 注意：如果使用了device_map，模型已经在加载时分配到各个设备，不需要再移动
+            if self.device_map is not None or self.multi_device:
+                # 多设备模式，模型已经通过device_map分配到各个设备
+                logger.info(f"模型已通过device_map分配到多个设备")
+                # 设置为评估模式
+                self.model.eval()
+            else:
+                # 单设备模式，需要手动移动模型
+                try:
+                    if self.device.type == "npu":
+                        # 昇腾NPU设备
+                        self.model = self.model.to(self.device)
+                        logger.info(f"模型已成功加载到{self.device}")
+                    elif self.device.type == "cuda":
+                        # GPU设备
                         self.model = self.model.to(self.device)
                         logger.info(f"模型已加载到{self.device}")
-                    except Exception as retry_error:
-                        logger.error(f"强制释放内存后仍然无法将模型移至GPU: {retry_error}")
-                        error_msg = (
-                            f"GPU内存不足，无法将模型移至GPU。已尝试强制释放内存但仍失败。\n"
-                            f"错误详情: {retry_error}\n"
-                            f"当前GPU内存使用: {self.get_gpu_memory_info()}\n"
-                            f"建议: 1) 减少其他GPU进程的内存使用\n"
-                            f"      2) 使用更小的模型\n"
-                            f"      3) 使用CPU模式运行（通过--force_cpu参数）"
-                        )
-                        raise RuntimeError(error_msg) from retry_error
-                # 如果移至NPU失败，回退到GPU或CPU（仅针对NPU错误）
-                elif self.device.type == "npu":
-                    logger.error(f"将模型移至NPU失败: {str(e)}")
-                    logger.info("尝试回退到GPU或CPU")
-                    if torch.cuda.is_available():
-                        self.device = torch.device("cuda:0")
-                        self.model = self.model.to(self.device)
-                        logger.info(f"模型已回退到{self.device}")
                     else:
-                        self.device = torch.device("cpu")
+                        # CPU设备
                         self.model = self.model.eval()
                         logger.info("模型在CPU上运行")
-                else:
-                    raise e
+                except RuntimeError as e:
+                    # 如果移至设备时内存不足，尝试强制释放后重试
+                    if "CUDA out of memory" in str(e) and self.device.type == "cuda":
+                        logger.warning("将模型移至GPU时内存不足，尝试强制释放内存后重试...")
+                        # 强制释放GPU内存
+                        self._force_release_gpu_memory("cuda")
+                        # 再次尝试移动
+                        try:
+                            logger.info("强制释放内存后，再次尝试将模型移至GPU...")
+                            self.model = self.model.to(self.device)
+                            logger.info(f"模型已加载到{self.device}")
+                        except Exception as retry_error:
+                            logger.error(f"强制释放内存后仍然无法将模型移至GPU: {retry_error}")
+                            error_msg = (
+                                f"GPU内存不足，无法将模型移至GPU。已尝试强制释放内存但仍失败。\n"
+                                f"错误详情: {retry_error}\n"
+                                f"当前GPU内存使用: {self.get_gpu_memory_info()}\n"
+                                f"建议: 1) 减少其他GPU进程的内存使用\n"
+                                f"      2) 使用更小的模型\n"
+                                f"      3) 使用CPU模式运行（通过--force_cpu参数）"
+                            )
+                            raise RuntimeError(error_msg) from retry_error
+                    # 如果移至NPU失败，回退到GPU或CPU（仅针对NPU错误）
+                    elif self.device.type == "npu":
+                        logger.error(f"将模型移至NPU失败: {str(e)}")
+                        logger.info("尝试回退到GPU或CPU")
+                        if torch.cuda.is_available():
+                            self.device = torch.device("cuda:0")
+                            self.model = self.model.to(self.device)
+                            logger.info(f"模型已回退到{self.device}")
+                        else:
+                            self.device = torch.device("cpu")
+                            self.model = self.model.eval()
+                            logger.info("模型在CPU上运行")
+                    else:
+                        raise e
 
             logger.info("✅ 模型加载完成")
         except Exception as e:
@@ -377,8 +473,15 @@ class EmbeddingExtractor:
             inputs = self.tokenizer(sequence, return_tensors="pt")
             
             # 移到指定设备
+            # 在多设备模式下，inputs需要移动到主设备（第一个设备）
+            # 模型内部会根据device_map自动处理数据在不同设备间的传输
             try:
-                if self.device.type == "npu":
+                if self.multi_device or self.device_map is not None:
+                    # 多设备模式：移动到主设备
+                    main_device = self.device
+                    if self.device.type == "npu" or self.device.type == "cuda":
+                        inputs = {k: v.to(main_device) for k, v in inputs.items()}
+                elif self.device.type == "npu":
                     # 昇腾NPU设备
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 elif self.device.type == "cuda":
@@ -396,7 +499,16 @@ class EmbeddingExtractor:
                 try:
                     outputs = self.model(**inputs)
                     # 根据设备类型同步
-                    if self.device.type == "cuda":
+                    # 多设备模式下，需要同步所有使用的设备
+                    if self.multi_device or self.device_map is not None:
+                        # 同步所有设备
+                        for device_str in self.devices:
+                            device_obj = torch.device(device_str)
+                            if device_obj.type == "cuda":
+                                torch.cuda.synchronize(device_obj)
+                            elif device_obj.type == "npu":
+                                torch.npu.synchronize(device_obj)
+                    elif self.device.type == "cuda":
                         torch.cuda.synchronize()
                     elif self.device.type == "npu":
                         # NPU也需要同步
@@ -548,15 +660,23 @@ class EmbeddingExtractor:
 extractors = {}
 
 
-def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtype=None):
+def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtype=None, device_map=None):
     """
     获取或创建指定模型的提取器
     
     Args:
         model_name (str): 模型名称
         force_cpu (bool): 是否强制使用CPU
-        device (str, optional): 设备类型，如果为None则自动选择
+        device (str or list, optional): 设备类型，如果为None则自动选择
+            - 单设备: "cuda:0" 或 "npu:0"
+            - 多设备: ["cuda:0", "cuda:1"] 或 ["npu:0", "npu:1"]
         torch_dtype (torch.dtype, optional): 数据类型，如果为None则根据设备自动选择
+        device_map (str or dict, optional): 设备映射方式
+            - "auto": 自动分配模型到可用设备
+            - "balanced": 平衡分配到所有设备
+            - "sequential": 按顺序分配到设备
+            - dict: 手动指定每层的设备映射
+            - None: 使用单设备模式
         
     Returns:
         EmbeddingExtractor: 提取器实例
@@ -590,7 +710,8 @@ def get_or_create_extractor(model_name, force_cpu=False, device=None, torch_dtyp
         device=device,
         torch_dtype=torch_dtype,
         model_name=model_name,
-        force_cpu=force_cpu
+        force_cpu=force_cpu,
+        device_map=device_map
     )
     extractors[model_name] = extractor
     
@@ -656,12 +777,22 @@ def run_server(args):
     # 根据命令行参数确定设备设置
     force_cpu = args.force_cpu
     device = args.device if args.device else None
+    device_map = args.device_map if args.device_map else None
     torch_dtype = None
     
+    # 处理设备参数：如果device包含逗号，则转换为列表（多设备模式）
+    if device and ',' in device:
+        device = [d.strip() for d in device.split(',')]
+        logger.info(f"检测到多设备模式: {device}")
+        # 如果指定了多设备但没有指定device_map，默认使用auto
+        if device_map is None:
+            device_map = "auto"
+            logger.info(f"多设备模式下，自动使用 device_map='auto'")
+    
     # 初始化模型提取器
-    logger.info(f"正在初始化模型提取器，强制CPU: {force_cpu}, 指定设备: {device}")
-    extractor = get_or_create_extractor("1.2B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype)
-    extractor = get_or_create_extractor("10B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype)
+    logger.info(f"正在初始化模型提取器，强制CPU: {force_cpu}, 指定设备: {device}, device_map: {device_map}")
+    extractor = get_or_create_extractor("1.2B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype, device_map=device_map)
+    extractor = get_or_create_extractor("10B", force_cpu=force_cpu, device=device, torch_dtype=torch_dtype, device_map=device_map)
     
     # 启动服务器
     logger.info(f"正在启动服务器，监听地址: {args.host}:{args.port}")
@@ -684,7 +815,11 @@ def parse_arguments():
     
     # 设备配置
     parser.add_argument('--force_cpu', action='store_true', help='强制使用CPU进行推理')
-    parser.add_argument('--device', type=str, default=None, help='指定运行设备 (npu:0, cuda:0, cpu)')
+    parser.add_argument('--device', type=str, default=None, 
+                        help='指定运行设备。单设备: npu:0, cuda:0, cpu。多设备: 用逗号分隔，如 "cuda:0,cuda:1" 或 "npu:0,npu:1"')
+    parser.add_argument('--device_map', type=str, default=None,
+                        help='设备映射方式: auto (自动分配), balanced (平衡分配), sequential (顺序分配)。'
+                             '如果指定了多设备(--device)，将自动使用device_map="auto"')
     
     # 日志配置
     parser.add_argument('--log_level', type=str, default='INFO', 
